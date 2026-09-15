@@ -57,7 +57,7 @@ To log in and start pulling data:
       owner-readable only. The login repeats weekly (Sunday reset).
 
 To use it from Claude Code, start `claude` in this directory. The ibkr MCP
-server and three ibkr skills load automatically; approve the server when
+server and four ibkr skills load automatically; approve the server when
 prompted. Try: "what did AAPL do yesterday?"
 
 To use it from a shell:
