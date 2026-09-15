@@ -1,0 +1,7 @@
+{
+  "_comment": "The watchlist: the symbols the nightly backfill maintains. Add your own. Each entry needs a symbol; everything else is optional. con_id is filled in by 'cli.py universe --resolve' and is the only identifier a fetch trusts. A null con_id with a note means resolution failed and the entry is still watched. intervals lists what the backfill maintains; intraday bars stay fetch on demand. An optional 'case' field is free text for grouping, if you want one.",
+  "symbols": [
+    {"symbol": "AAPL", "exchange": "SMART", "currency": "USD", "primary_exchange": null, "con_id": null, "long_name": null, "intervals": ["1d"]},
+    {"symbol": "MSFT", "exchange": "SMART", "currency": "USD", "primary_exchange": null, "con_id": null, "long_name": null, "intervals": ["1d"]}
+  ]
+}

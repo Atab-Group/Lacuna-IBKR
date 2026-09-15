@@ -1,0 +1,17 @@
+{
+  "name": "lacuna-ibkr",
+  "owner": {
+    "name": "Lacuna",
+    "url": "https://github.com/Atab-Group/Lacuna-IBKR"
+  },
+  "metadata": {
+    "description": "Read-only Interactive Brokers market data for Claude Code and other AI agents.",
+    "version": "0.3.0"
+  },
+  "plugins": [
+    {
+      "name": "ibkr",
+      "source": "./ibkr-plugin"
+    }
+  ]
+}

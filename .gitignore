@@ -1,0 +1,31 @@
+# Virtualenv and Python residue
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Credentials. Never commit these.
+.env
+services/ibkr-data/deploy/.env
+
+# Local market data store and everything generated into it
+data/
+shared/
+*.parquet
+*.duckdb
+jobs.db
+contracts.json
+
+# Gateway and session state
+services/ibkr-data/deploy/jts/
+services/ibkr-data/deploy/Jts/
+services/ibkr-data/deploy/ibc-config.ini
+
+# Logs and run output
+*.log
+dist/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/

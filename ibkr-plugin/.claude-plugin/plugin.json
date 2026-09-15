@@ -1,0 +1,8 @@
+{
+  "name": "ibkr",
+  "description": "Read-only Interactive Brokers market data for AI agents: historical bars down to 30-second resolution, event windows around a timestamp, and a local parquet store, via a stdio MCP server plus setup, login, status and market-data skills. It cannot place an order.",
+  "version": "0.3.0",
+  "author": {
+    "name": "Lacuna"
+  }
+}

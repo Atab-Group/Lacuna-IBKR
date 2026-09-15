@@ -1,0 +1,41 @@
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: lacuna-ib-gateway
+    # Deliberately no restart policy. A failed 2FA must stop and wait for a
+    # human. Retrying costs login attempts, and IBKR throttles then locks the
+    # account after a handful of failures.
+    restart: "no"
+    env_file: .env
+    environment:
+      TRADING_MODE: ${TRADING_MODE:-live}
+      READ_ONLY_API: ${READ_ONLY_API:-yes}
+      # The 2FA dialog lives 180 seconds. On timeout, exit and wait for a
+      # human. Do NOT set RELOGIN_AFTER_TWOFA_TIMEOUT=yes: it retries every
+      # few minutes, burns login attempts and gets the account throttled.
+      TWOFA_TIMEOUT_ACTION: exit
+      RELOGIN_AFTER_TWOFA_TIMEOUT: 'no'
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:59 PM}
+      TIME_ZONE: ${TIME_ZONE:-Africa/Johannesburg}
+      BYPASS_WARNING: 'yes'
+    volumes:
+      # The gateway's settings directory, which holds IBC's autorestart token.
+      # Without this, `docker compose down` throws away the session and the
+      # next start needs a full 2FA login. A named volume rather than a bind
+      # mount on purpose: the directory contains the password in cleartext
+      # (launcher.log), so it stays inside Docker and out of the repo.
+      - jts-settings:/home/ibgateway/Jts
+      # Stock template with one line changed: SecondFactorAuthenticationTimeout
+      # raised from 180 to 900. Three minutes is not enough time for a human to
+      # fetch a code from an authenticator app and get it typed. The image runs
+      # envsubst over this at startup, so the password still comes from .env
+      # and never lands in the file.
+      - ./ibc-config.ini.tmpl:/home/ibgateway/ibc/config.ini.tmpl:ro
+    ports:
+      # API socket. Live is 4001 inside the container, paper 4002.
+      - "127.0.0.1:4001:4003"
+      # VNC, for watching the login when it misbehaves.
+      - "127.0.0.1:5901:5900"
+
+volumes:
+  jts-settings:

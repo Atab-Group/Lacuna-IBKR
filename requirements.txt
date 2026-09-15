@@ -1,0 +1,7 @@
+ib_async>=2.1.0
+pyarrow>=17.0
+duckdb>=1.1
+pandas>=2.2
+rich>=13.0
+vncdotool>=1.2
+pyotp>=2.9

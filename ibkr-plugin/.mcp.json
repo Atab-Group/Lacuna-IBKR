@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ibkr": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/python",
+      "args": ["${CLAUDE_PROJECT_DIR}/services/ibkr-data/mcpserver.py"]
+    }
+  }
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Wrapper so the repo path may contain spaces, which a shebang cannot.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$here/../../.venv/bin/python" "$here/gateway.py" "$@"
