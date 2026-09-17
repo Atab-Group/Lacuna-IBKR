@@ -11,8 +11,8 @@ IBKR's historical data API is rate-limited, and the limit is enforced by
   even if nothing else was pulled that day.
 - **`BID_ASK` requests count double** against the same 60/10-minute budget.
   Ordinary trade bars (open/high/low/close/volume) count once.
-- **No identical request within 15 seconds.** Same symbol, interval, date
-  range, and session, requested twice inside 15 seconds: the second one is
+- **No identical request within 15 seconds.** Same contract, data type,
+  interval, date range, and session, requested twice inside 15 seconds: the second one is
   refused or silently degraded rather than served fresh.
 - **Max 50 open requests at once.** Relevant to bulk backfills rather than a
   single tool call.
@@ -22,8 +22,9 @@ IBKR's historical data API is rate-limited, and the limit is enforced by
 
 ## What the `coverage` block means
 
-Every response from `ibkr_get_bars` and `ibkr_event_window` carries a
-`coverage` block. Read it before trusting the row count:
+Every historical-bar response carries a `coverage` block. Read it before
+trusting the row count. The top-level contract and `data_type` identify which
+dataset the coverage describes:
 
 - `requested`: the range and interval actually asked for.
 - `source`: `cache` (served from the parquet store, no budget spent) or
@@ -37,8 +38,11 @@ Every response from `ibkr_get_bars` and `ibkr_event_window` carries a
 - `budget_remaining`: requests left in the current 10-minute window, so a
   model can decide whether to ask for more right now or wait.
 
-A tool that returns 40 bars when 390 were asked for is only honest because
-`coverage` says so. Never infer completeness from row count alone.
+A sparse option `TRADES` series can have fewer rows than BID, ASK or MIDPOINT
+because no trade occurred during some quote intervals. `coverage` reports
+observations against the requested grid; it does not turn no-trade intervals
+into synthetic trades. Never infer completeness or market closure from row
+count alone.
 
 ## How `ibkr_get_bars` chunks a fetch
 
@@ -55,3 +59,18 @@ pull (say, 30-second bars over several months) can consume a large fraction
 of the 60/10-minute budget in one tool call. Ask `ibkr_data_coverage` first
 if you are about to request a large range you have not pulled before, so the
 budget spend is a choice rather than a surprise.
+
+Delayed streaming snapshots use bounded subscriptions rather than this
+historical request bucket. Still keep option selections narrow: every selected
+contract occupies a market-data line until the tool cancels it. A timeout or
+partial field set is a valid result, and subscriptions must always be cancelled.
+
+## Current-window historical series
+
+IBKR requires a blank end time for `ADJUSTED_LAST`. The service spends at most
+one bounded historical chunk from now back through the requested start and then
+filters to `[start, end)`. A start outside that interval's one-chunk reach returns
+`adjusted_last_current_window_limit`; repeating it cannot extend the window.
+`CONTFUT` has the same one-current-chunk shape because IBKR rejects explicit end
+times. Historical gateway calls have a 30-second client timeout, so an upstream
+stall returns control instead of holding a worker indefinitely.

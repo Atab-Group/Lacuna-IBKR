@@ -1,113 +1,137 @@
 ---
 name: market-data
-description: Use for any question about what a listed stock did at or around a moment in time, event studies on a dated announcement or filing, price checks on a name, building bar datasets, or comparing a name against a sector proxy, via the ibkr_ MCP tools; also covers IBKR gateway session state when a tool call fails.
+description: Use for read-only IBKR market-data work across equities, options, indexes, futures and FX, including contract resolution, option chains, delayed quotes and Greeks, historical bars, captured option snapshots, event studies, coverage and gateway state.
 ---
 
 # IBKR market data
 
-Nine read-only tools, all prefixed `ibkr_`. They read historical and (v2) live
-bars from IB Gateway through a local cache. Nothing here places an order,
-reads a position, or reads an account value. That refusal is permanent and
-deliberate.
+Use the `ibkr_` tools for read-only contract and market-data questions. They do
+not expose orders, positions or account values. Do not attempt to add or infer
+trading actions through this skill.
 
-## When to use this, and when not to
+## Choose the operation
 
-Use it for: a stock's move around a dated announcement, an event study on a
-filing or a court date, a plain price check, building a bar dataset for a
-notebook, a name-versus-sector comparison, checking whether IBKR actually
-holds data for a symbol and interval.
-
-Do not use it for: portfolio state, account value, or positions (out of scope and
-unimplemented); anything that places, modifies, or cancels an order (refused
-permanently, at three layers: the tool surface, the MCP server, and the
-gateway's own read-only API key).
-
-## Decision table
-
-| Question shape | Tool |
+| Need | Tool |
 |---|---|
-| "Is the session even up?" / any tool call errors | `ibkr_status` |
-| "What symbols do we track?" | `ibkr_list_symbols` |
-| "What's the conId / exchange for this ADR or unlisted name?" | `ibkr_resolve_contract` |
-| "Give me bars for X between two dates" | `ibkr_get_bars` |
-| "What did X do around this timestamp?" (the common case) | `ibkr_event_window` |
-| "Same window, several names" | `ibkr_compare_symbols` |
-| "How far back does data for X actually go, and are there gaps?" | `ibkr_data_coverage` |
-| A question the shaped tools can't ask | `ibkr_query_sql` |
-| "What's X trading at right now?" | `ibkr_get_quote` (v2; returns "not collected" until built) |
+| Check the service, gateway, pacing budget or store | `ibkr_status` |
+| List the configured equity watchlist | `ibkr_list_symbols` |
+| Resolve a stock or a precise instrument | `ibkr_resolve_contract` |
+| Discover expirations, strikes and option contracts | `ibkr_option_chain` |
+| Read a delayed quote for one instrument | `ibkr_get_quote` |
+| Read delayed quotes, Greeks and open interest for options | `ibkr_option_snapshot` |
+| Save current option snapshots for later research | `ibkr_capture_option_snapshots` |
+| Read option snapshots already saved locally | `ibkr_get_option_snapshots` |
+| Explain implemented series and optionally probe gateway connectivity | `ibkr_market_data_capabilities` |
+| Get historical bars for an instrument and data series | `ibkr_get_bars` |
+| Analyze one stock around an event | `ibkr_event_window` |
+| Compare several watched stocks around an event | `ibkr_compare_symbols` |
+| Inspect cached coverage | `ibkr_data_coverage` |
+| Query stored parquet data when shaped tools cannot express the question | `ibkr_query_sql` |
 
-`ibkr_event_window` is the tool to reach for first for most
-questions about a dated event: pass `symbol`, `event_at`, `before`, `after`, and it returns bars
-around the timestamp plus moves at the four standard horizons the service
-uses. Leave `interval` unset and it picks the finest one retention allows.
+For options, resolve by `con_id` whenever one is already known. Otherwise give
+the full selector: underlying, expiry, strike, right, exchange/currency where
+needed, multiplier and trading class when ambiguity remains. A ticker does not
+uniquely identify an option.
 
-## Session model, compressed
+`ibkr_option_chain` returns listed expirations and strikes plus qualified
+contracts when requested. The expiration and strike sets are not a Cartesian
+product; use returned qualified contracts rather than inventing combinations.
+Bound the expiry/strike/right selection before asking for snapshots. The tools
+also impose caps so one request cannot subscribe to an entire large chain.
 
-The gateway needs a human once a week rather than once a session. A prior login's
-token survives the gateway's own daily restart, so tools keep working for
-days without anyone touching a keyboard. It stops working when the weekly
-Sunday ~01:00 US Eastern token invalidation hits, or when the container
-crashes or is brought down.
+## Interpret snapshots carefully
 
-When a tool call fails on session state: call `ibkr_status`. It returns the
-login URL. A human opens it and types a code from their authenticator app.
-**Never retry a login programmatically.** IBKR's throttle sits directly in
-front of a lockout: repeated automated attempts are read as the same failure
-IBKR treats as an attack, and the lockout that follows is worse than the
-outage that caused you to retry. Report the down state and the URL, then
-stop.
+Quote and option snapshot responses report the actual market-data type and a
+collection time. On accounts without live subscriptions this is commonly
+delayed data. The collection time is when this service received the values; it
+is not an exchange trade timestamp and does not measure the exact delay.
 
-## The five traps
+Snapshot fields can arrive at different times. Read `field_status`, the overall
+status, warnings/errors and populated fields, and preserve useful partial
+results. A subscription warning can coexist with valid delayed prices or model
+Greeks. Missing IBKR sentinels are normalized to null; legitimate negative put
+delta and theta remain valid values.
 
-- **Pacing failures are silent.** A violated 60-requests/10-minute budget
-  returns an empty response rather than an error. Trust the `coverage` block on
-  every response rather than the row count: it says whether data was `fetched` or
-  came from `cache`, and whether a gap is a real market gap or a denied
-  fetch.
-- **Sub-minute retention beats the documented limit, but verify per name.**
-  IBKR's docs cap 30-second bars at six months; live testing found full
-  sessions 3+ years back. Call `ibkr_data_coverage` before promising a date
-  range at that resolution instead of assuming either number.
-- **ADRs and unlisted names need `ibkr_resolve_contract` first.** Passing a
-  bare ticker to `ibkr_get_bars` for a name outside the tracked universe can
-  resolve to the wrong exchange or currency.
-- **Live quotes are delayed; historical bars are not.** A fresh account gets
-  delayed-only streaming data, so `ibkr_get_quote` can be stale by minutes.
-  Historical bars carry no such discount regardless of subscription level.
-- **Pre-market and after-hours prints exist and matter.** News that lands
-  before the open needs `session=eth` bars. Every bar row carries
-  its own `session` field so a pre-market print is never compared against a
-  regular-hours close.
+`model_greeks` is generally the most complete current model result. Bid, ask or
+last Greeks may be unavailable. Open interest and volume are point-in-time
+fields when returned, not historical series. Do not use implausible volume
+values without checking them against another source.
+
+`ibkr_capture_option_snapshots` saves the current response. Repeated captures
+can build local strike-level IV, Greek, quote and open-interest history from the
+time collection begins. It does not backfill past snapshots and no capture
+schedule is enabled automatically.
+
+`ibkr_get_option_snapshots` is cache-only: pass `con_id` and optional start/end
+times. It never contacts IBKR or spends pacing budget. Null fields remain null;
+use their saved `field_status`, warnings and collection time when comparing
+captures.
+
+## Historical series
+
+`ibkr_get_bars` accepts an exact contract and a `data_type`: `TRADES`, `BID`,
+`ASK`, `MIDPOINT`, `BID_ASK`, `ADJUSTED_LAST`, `HISTORICAL_VOLATILITY`, or
+`OPTION_IMPLIED_VOLATILITY`. Support depends on the instrument. Use
+`ibkr_market_data_capabilities` when choosing a series.
+
+IBKR serves intraday historical trade and quote bars for active options, but a
+direct daily option or futures-option request fails with no end-of-day option
+chart data. Do
+not present an intraday aggregation as an exchange daily bar unless you derive
+and label it, and only do so when coverage is sufficient.
+
+`OPTION_IMPLIED_VOLATILITY` and `HISTORICAL_VOLATILITY` are underlying-level
+historical series. They are not a past strike-by-strike IV surface or historical
+Greeks. Strike-level history exists only for snapshots captured locally after
+collection starts.
+
+Sparse option `TRADES` bars can mean no trade occurred. Compare BID, ASK or
+MIDPOINT coverage before calling a missing trade bar a data outage. A returned
+head timestamp is the earliest result for that contract and series, not a
+universal IBKR retention promise.
+
+For generalized history, `session=rth` requests regular trading hours only;
+`session=eth` maps to IBKR `useRTH=false` and therefore includes all available
+hours, including regular hours. It does not mean an after-hours-only dataset.
+Legacy US-equity event data can still carry row-level `rth`/`eth` labels based
+on the 09:30–16:00 Eastern clock.
+
+Continuous futures (`CONTFUT`) accept one current-window chunk because IBKR
+rejects an explicit historical end time for them. Treat that as a current
+continuous series, not a promise that arbitrary dated windows can be backfilled.
+
+`ADJUSTED_LAST` also requires an empty IBKR end time. The service can fetch one
+bounded chunk from now back through the requested start, then filters the stored
+result to the exact requested window. If the start lies beyond one permitted
+chunk for the interval, it returns `adjusted_last_current_window_limit`; choose
+a coarser interval or another series instead of retrying the same request.
+
+## Coverage, pacing and recovery
+
+Read the `coverage` block before using historical results. Its contract and
+`data_type` identify the dataset; its gaps and request metadata distinguish
+cached data, pacing denial, an empty IBKR response and actual observations.
+Trade and quote datasets are stored separately.
+
+`ibkr_market_data_capabilities(probe=true)` checks whether the gateway answers
+and reports the static interface matrix. It does not prove that this account is
+entitled to every listed asset, exchange, field or historical series. Use a
+bounded request for the exact contract to establish actual availability.
+
+IBKR historical pacing is shared by every caller: 60 request units per rolling
+10 minutes, with `BID_ASK` spending two. The local ledger enforces this budget.
+Never bypass it. Read [references/pacing.md](references/pacing.md) before a wide
+or fine-grained pull.
+
+If a call fails on session state, use `ibkr_status`. Give the returned login URL
+to the human and stop. Never submit credentials, type a two-factor code or retry
+a failed login programmatically. A running local socket alone does not prove the
+upstream market-data farms are healthy; a small data request is the useful check.
 
 ## References
 
-Read only the one you need:
-
-- `references/pacing.md`: the budget numbers, what the `coverage` block
-  means, how `ibkr_get_bars` chunks a fetch.
-- `references/store.md`: the parquet layout on disk, bar columns, DuckDB
-  glob examples, and direct pandas access for notebooks.
-- `references/event-studies.md`: `event_window` semantics, the horizons
-  the service defines, `rth` versus `eth`, and the
-  verified retention facts.
-
-
-## Gateway recovery fixes (0.1.1)
-
-A running container, an open API port, or a successful API handshake does
-not prove the upstream market-data connection works. Verify recovery with
-one small historical-bar request and inspect its returned data and coverage.
-Errors 1100/2110 indicate lost upstream connectivity; 2103/2157 identify
-broken data/security-definition connections. Do not diagnose every empty
-response as a login failure: check contract resolution, permissions, session
-filtering and the fetch metadata first.
-
-The data client and login probe use the low-level API handshake, skipping
-`IB.connect` account/order synchronization. Never enable write access to
-resolve an "API client needs write access" prompt for this service.
-
-IBC has a separate "Re-login is required" dialog handler which can retry
-even when the second-factor retry setting is disabled. The web UI stops the
-container after failed attempts. If an unattended re-login loop is observed,
-stop the container and leave the next login to the human; never automate a
-retry. This cleanup is containment, not a change to IBC's internal handler.
+- Read [references/store.md](references/store.md) before direct parquet,
+  DuckDB or notebook access, or when configuring a shared store.
+- Read [references/pacing.md](references/pacing.md) before bulk history pulls.
+- Read [references/event-studies.md](references/event-studies.md) for stock
+  event-window semantics, sessions and retention caveats.

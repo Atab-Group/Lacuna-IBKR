@@ -1,6 +1,6 @@
 ---
 name: setup
-description: "Use when someone has just installed the IBKR market-data plugin, or unpacked its bundle, and wants it working, or says they were told to run the setup skill, or asks how to get stock prices working for the first time. Takes them from a fresh copy to real market data, doing every technical step itself, and asking the person for nothing except their own login at the local login page."
+description: "Use when someone has just installed the IBKR market-data plugin, or unpacked its bundle, and wants equities, options or other supported market data working for the first time. Takes them from a fresh copy to real data, doing every technical step itself, and asking the person for nothing except their own login at the local login page."
 ---
 
 # Setting up market data
@@ -292,6 +292,14 @@ words what you found:
 
 > Connected. Apple last closed at 231.44 on 12 September, and that came from
 > real market data rather than anything cached.
+
+This equity pull proves the connection and that one historical path. It does
+not prove every exchange or option field is entitled. The capabilities probe
+can confirm gateway connectivity and the implemented interface, but it is not
+an entitlement test. When the person first asks for options, FX, futures,
+indexes or delayed snapshot fields, make a small bounded request for the exact
+contract and report partial availability as returned. Never purchase or change
+an entitlement.
 
 ## Step 7. The companies they care about
 

@@ -1,3 +1,32 @@
+# 0.5.0 - 18 September 2026
+
+- Added generalized contract resolution by `conId` or full instrument fields,
+  including options. Derivative identity preserves expiry, strike, right,
+  multiplier and trading class.
+- Added option-chain discovery, bounded delayed option snapshots, model Greeks,
+  open interest where available, and explicit account/data capability reporting.
+- Added local option-snapshot capture. Captured values remain queryable after
+  collection through `ibkr_get_option_snapshots`; IBKR does not supply a
+  historical strike-level Greek or IV surface.
+- Historical bars now support trade, bid, ask, midpoint, bid/ask, adjusted-last,
+  historical-volatility and option-implied-volatility series where IBKR supports
+  them for the selected instrument. Option daily bars are rejected because IBKR
+  does not serve them directly.
+- Bar storage and the request ledger now include contract and data-series identity,
+  so two strikes or trade and quote bars cannot overwrite one another. The old
+  equity trade cache remains readable; every newly qualified contract writes v2.
+- `ibkr_get_quote` now returns a bounded delayed snapshot rather than a placeholder.
+  Snapshot responses preserve partial values, per-field status and warnings/errors,
+  report the actual market-data type, and normalize IBKR missing-value sentinels without
+  discarding valid negative Greeks.
+- Updated the market-data skill and operator documentation with the measured limits:
+  delayed access depends on account entitlements, sparse option trades are not
+  missing quote coverage, underlying IV is not strike-level IV history, and no
+  collection schedule is enabled automatically.
+- Clarified session semantics: generalized `eth` is the all-hours IBKR request
+  mode (`useRTH=false`), so it includes regular hours. Clock-classified legacy
+  US-equity event rows keep their existing `rth`/`eth` labels.
+
 # 0.4.0 - 17 September 2026
 
 - The market data now works from every folder, and inside Cowork. The plugin

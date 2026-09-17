@@ -8,6 +8,7 @@ and the protocol handshake, and the Ctx is pointed at a temporary store.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import urllib.error
@@ -127,7 +128,7 @@ def test_healthz_needs_no_token(live):
     assert status == 200
     assert body["status"] == "ok"
     assert body["server"] == "ibkr-data"
-    assert body["tools"] == 9
+    assert body["tools"] == 14
 
 
 def test_healthz_is_the_only_unauthenticated_route(live):
@@ -139,13 +140,13 @@ def test_healthz_is_the_only_unauthenticated_route(live):
 
 # ----------------------------------------------------------------- tools ----
 
-def test_tools_list_over_http_returns_the_nine_tools(live):
+def test_tools_list_over_http_returns_market_data_tools(live):
     base, token, _, _ = live
     status, body = post(base, LIST, token)
 
     assert status == 200
     names = [t["name"] for t in body["result"]["tools"]]
-    assert len(names) == 9
+    assert len(names) == 14
     assert names == mcpserver.TOOL_NAMES
     assert "ibkr_get_bars" in names
 
@@ -170,6 +171,24 @@ def test_initialize_then_a_call_shares_one_session(live):
     # A handshake-era result carries no resultType, which is how we know the
     # era carried across the two requests.
     assert "resultType" not in body["result"]
+
+
+def test_request_worker_has_an_asyncio_loop_for_ib_async(live, monkeypatch):
+    """Authenticated dispatch runs where the synchronous ib_async facade can."""
+    base, token, _, _ = live
+    seen_open = []
+
+    def fake_handle_message(session, message):
+        loop = asyncio.get_event_loop()
+        seen_open.append(not loop.is_closed())
+        return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"ok": True}}
+
+    monkeypatch.setattr(mcpserver, "handle_message", fake_handle_message)
+    status, body = post(base, LIST, token)
+
+    assert status == 200
+    assert body["result"] == {"ok": True}
+    assert seen_open == [True]
 
 
 def test_a_notification_gets_no_body(live):
@@ -246,6 +265,15 @@ def test_a_second_live_token_with_the_same_name_is_refused(tmp_path):
     tokenlib.add_token(path, "laptop")
     with pytest.raises(ValueError):
         tokenlib.add_token(path, "laptop")
+
+
+@pytest.mark.parametrize("document", [[], "token", 17, None])
+def test_a_non_object_token_document_fails_closed(tmp_path, document):
+    path = tmp_path / "tokens.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert tokenlib.load_tokens(str(path)) == []
+    assert tokenlib.TokenStore(str(path)).check("anything") is None
 
 
 def test_the_token_file_is_not_world_readable(tmp_path):

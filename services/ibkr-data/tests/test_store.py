@@ -38,7 +38,7 @@ def test_write_then_read_round_trip(root):
     written = store.write_bars(rows, root)
     assert len(written) == 1
     back = store.read_bars("MSFT", "1m", root_dir=root)
-    assert back == rows
+    assert [{k: item[k] for k in rows[0]} for item in back] == rows
 
 
 def test_intraday_writes_one_file_per_day_daily_one_per_year(root):

@@ -95,8 +95,8 @@ def _print_result(result, limit=20, as_csv=False):
 def cmd_resolve(args) -> int:
     client = _client(args)
     try:
-        contract = contractlib.resolve(args.symbol, client=client,
-                                       refresh=args.refresh)
+        contract = contractlib.resolve_selector(_selector_args(args), client=client,
+                                                refresh=args.refresh)
     except Exception as exc:   # LookupError and GatewayDown both land here
         print(f"could not resolve {args.symbol}: {exc}", file=sys.stderr)
         return 1
@@ -111,10 +111,13 @@ def cmd_bars(args) -> int:
     end = args.end or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     client = _client(args)
     try:
-        result = jobs.ensure_bars(args.symbol, args.interval, args.start, end,
+        contract = None
+        if args.con_id or args.sec_type != "STK" or args.data_type != "TRADES":
+            contract = contractlib.resolve_selector(_selector_args(args), client=client)
+        result = jobs.ensure_bars(args.symbol or contract["symbol"], args.interval, args.start, end,
                                   session=args.session,
                                   allow_fetch=not args.no_fetch,
-                                  client=client)
+                                  client=client, contract=contract, what=args.data_type)
     finally:
         if client:
             client.disconnect()
@@ -171,7 +174,37 @@ def cmd_coverage(args) -> int:
 # the watchlist (pure, apart from the one file read)
 # --------------------------------------------------------------------------
 
-UNIVERSE_PATH = Path(__file__).resolve().parent / "universe.json"
+UNIVERSE_PATH = Path(os.environ.get("LACUNA_IBKR_UNIVERSE") or
+                     Path(__file__).resolve().parent / "universe.json")
+
+
+def _selector_args(args):
+    keys = ("symbol", "con_id", "sec_type", "exchange", "currency", "expiry",
+            "strike", "right", "multiplier", "trading_class")
+    return {k: getattr(args, k) for k in keys if hasattr(args, k) and
+            getattr(args, k) not in (None, "")}
+
+
+def cmd_chain(args) -> int:
+    import mcpserver
+    result = mcpserver.tool_option_chain(vars(args))
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if "error" in result else 0
+
+
+def cmd_quote(args) -> int:
+    import mcpserver
+    result = mcpserver.tool_get_quote(vars(args))
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if "error" in result else 0
+
+
+def cmd_snapshot(args) -> int:
+    import mcpserver
+    fn = mcpserver.tool_capture_option_snapshots if args.capture else mcpserver.tool_option_snapshot
+    result = fn(vars(args))
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if "error" in result else 0
 
 # 221 to 230 is the watchlist band. 201 to 210 is ibclient's default for ad hoc
 # calls and 211 to 220 belongs to the MCP server.
@@ -448,8 +481,25 @@ def build_parser() -> argparse.ArgumentParser:
                          help="cache only, never open the gateway")
     resolve.set_defaults(func=cmd_resolve)
 
+    def selector_flags(command, positional=False):
+        if not positional:
+            command.add_argument("--symbol", default=None)
+        command.add_argument("--con-id", type=int, default=None)
+        command.add_argument("--sec-type", default="STK",
+                             choices=("STK", "OPT", "IND", "CASH", "FUT", "CONTFUT", "FOP"))
+        command.add_argument("--exchange", default="SMART")
+        command.add_argument("--currency", default="USD")
+        command.add_argument("--expiry", default=None)
+        command.add_argument("--strike", type=float, default=None)
+        command.add_argument("--right", choices=("C", "P", "CALL", "PUT"), default=None)
+        command.add_argument("--multiplier", default=None)
+        command.add_argument("--trading-class", default=None)
+
+    selector_flags(resolve, positional=True)
+
     bars_cmd = sub.add_parser("bars", help="serve a range, fetching what is missing")
-    bars_cmd.add_argument("symbol")
+    bars_cmd.add_argument("symbol", nargs="?", default=None)
+    selector_flags(bars_cmd, positional=True)
     bars_cmd.add_argument("--interval", default="1d")
     bars_cmd.add_argument("--start", required=True)
     bars_cmd.add_argument("--end", default=None)
@@ -457,7 +507,35 @@ def build_parser() -> argparse.ArgumentParser:
     bars_cmd.add_argument("--no-fetch", action="store_true")
     bars_cmd.add_argument("--limit", type=int, default=20)
     bars_cmd.add_argument("--csv", action="store_true")
+    bars_cmd.add_argument("--data-type", default="TRADES", choices=("TRADES", "BID", "ASK", "MIDPOINT", "BID_ASK", "ADJUSTED_LAST", "HISTORICAL_VOLATILITY", "OPTION_IMPLIED_VOLATILITY"))
     bars_cmd.set_defaults(func=cmd_bars)
+
+    chain = sub.add_parser("chain", help="discover and qualify a bounded option chain")
+    chain.add_argument("underlying")
+    chain.add_argument("--expiry", default=None)
+    chain.add_argument("--strike-min", type=float, default=None)
+    chain.add_argument("--strike-max", type=float, default=None)
+    chain.add_argument("--strikes", nargs="*", type=float, default=None)
+    chain.add_argument("--right", choices=("C", "P", "CALL", "PUT"), default=None)
+    chain.add_argument("--max-contracts", type=int, default=100)
+    chain.add_argument("--no-qualify", dest="qualify", action="store_false")
+    chain.set_defaults(func=cmd_chain, qualify=True)
+
+    quote = sub.add_parser("quote", help="bounded delayed quote")
+    selector_flags(quote)
+    quote.add_argument("--timeout-seconds", type=float, default=8)
+    quote.set_defaults(func=cmd_quote)
+
+    snap = sub.add_parser("snapshot", help="bounded delayed option snapshots")
+    snap.add_argument("underlying")
+    snap.add_argument("--expiry", default=None)
+    snap.add_argument("--strikes", nargs="*", type=float, default=None)
+    snap.add_argument("--right", choices=("C", "P", "CALL", "PUT"), default=None)
+    snap.add_argument("--max-contracts", type=int, default=20)
+    snap.add_argument("--timeout-seconds", type=float, default=8)
+    snap.add_argument("--capture", action="store_true",
+                      help="retain snapshots in parquet for historical reuse")
+    snap.set_defaults(func=cmd_snapshot)
 
     pull = sub.add_parser("pull", help="one session date, the event-day call")
     pull.add_argument("symbol")

@@ -1,9 +1,9 @@
 # ibkr-data
 
-Read-only market data from Interactive Brokers, for event studies that free
-sources cannot serve. Yahoo gives 1-minute bars for 30 days only, so anything
-older than a month coarsens to daily bars. IBKR gives minute bars going back
-years, and 30-second bars going back further than its own documentation admits.
+Read-only market data from Interactive Brokers for equities, options, indexes,
+futures and FX. It resolves exact contracts, discovers option chains, reads
+delayed quotes and option Greeks, stores historical trade and quote bars, and
+captures point-in-time option snapshots for future research.
 
 Nothing in this service can place an order.
 
@@ -14,6 +14,9 @@ version:
 
     .venv/bin/python services/ibkr-data/cli.py resolve MSFT
     .venv/bin/python services/ibkr-data/cli.py bars MSFT --interval 1d --start 2026-08-01
+    .venv/bin/python services/ibkr-data/cli.py chain AAPL --max-contracts 20
+    .venv/bin/python services/ibkr-data/cli.py quote --con-id 922317899
+    .venv/bin/python services/ibkr-data/cli.py snapshot AAPL --max-contracts 4
     .venv/bin/python services/ibkr-data/cli.py pull MSFT --interval 1m --date 2026-06-25
     .venv/bin/python services/ibkr-data/cli.py coverage MSFT
 
@@ -118,10 +121,13 @@ does the job:
 
 ## Reading the result
 
-The script answers the question that decides the whole design: whether this
-username gets historical bars with no market data subscription. Delayed data
-only degrades live streaming quotes; historical bars are the same data either
-way. So `EMPTY` on daily bars means a permissions problem, not a delay.
+The capability probe establishes gateway connectivity and reports the
+implemented interface; it does not audit entitlements. Delayed snapshots,
+historical availability and permissions vary by account, exchange, instrument
+and series. A bounded request for the exact contract is the availability test.
+An empty response can also mean a
+calendar gap, no trade, a contract mismatch or pacing denial; inspect coverage
+and request metadata before diagnosing permissions.
 
 A subscription added under a secondary username bills the account owner. Do not
 add one without asking them.
@@ -131,8 +137,9 @@ add one without asking them.
 Tested against a read-only secondary username with no market data
 subscriptions.
 
-- Historical bars need no subscriptions. Every symbol tried returned both daily
-  and intraday bars on a bare account.
+- The tested account returned equity and active-option historical bars, delayed
+  quotes, model Greeks and open interest without buying another feed. This does
+  not establish free access for every account or market.
 - Daily history reaches back decades. AAPL goes to 1980-12-12. How far back any
   given contract goes varies, and `reqHeadTimeStamp` is the only honest answer
   for a name you have not pulled before.
@@ -147,6 +154,14 @@ subscriptions.
 That last point is the reason this service exists. Yahoo caps 1-minute data at
 30 days, so anything older silently degrades to daily bars. IBKR serves
 30-second resolution years back instead.
+
+On the same account, active AAPL options returned intraday TRADES, BID, ASK,
+MIDPOINT and BID_ASK bars plus delayed model Greeks. Direct daily option and
+futures-option bars are rejected. Historical `OPTION_IMPLIED_VOLATILITY` and
+`HISTORICAL_VOLATILITY` are underlying-level series, not past strike-level IV
+or Greek surfaces. Use repeated snapshot captures to build that history from
+the collection date onward, then read it with the cache-only
+`ibkr_get_option_snapshots` tool; no collector schedule is enabled by setup.
 
 ## How often a code is actually needed
 
@@ -181,8 +196,22 @@ also invalidate the owner's existing enrolment on their own phone.
 - A violated pacing limit returns an empty response rather than an error, so
   "no bars" and "hit the rate limit" look identical. The limit is 60 historical
   requests per rolling 10 minutes, and BID_ASK requests count twice.
-- Bars of 30 seconds or finer only go back six months. Minute bars go back
-  years. `reqHeadTimeStamp` gives the exact earliest point per contract.
+- Retention is contract and series specific. `reqHeadTimeStamp` gives the
+  earliest result IBKR currently returns for an exact contract and data type;
+  it is not a universal or permanent retention guarantee.
+- Sparse option trade bars can be valid when no trade occurred. Compare quote
+  series before treating a missing trade interval as missing market data.
+- Snapshot fields arrive asynchronously and may be partial. Preserve usable
+  delayed values even when IBKR also reports a subscription warning. Read the
+  per-field and overall status, warnings/errors and populated fields. Missing
+  sentinels are null; negative delta and theta can be legitimate.
+- On generalized history, `session=eth` means all available hours because it
+  maps to `useRTH=false`; regular-hours bars are included. It is not an
+  after-hours-only filter. Legacy US-equity event rows can still use clock-based
+  `rth`/`eth` labels.
+- Continuous futures are limited to one current-window chunk because IBKR
+  rejects explicit end times for `CONTFUT`; they are not arbitrary dated
+  backfill instruments.
 - The gateway restarts itself daily, and IBKR invalidates the session weekly on
   Sunday around 01:00 US Eastern, which needs a fresh 2FA code.
 - With a TOTP authenticator app, the gateway shows a dialog reading

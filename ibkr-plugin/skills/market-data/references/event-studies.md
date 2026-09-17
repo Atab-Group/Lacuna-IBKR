@@ -35,21 +35,23 @@ HORIZONS = {"30s": pd.Timedelta(seconds=30),
 
 `ibkr_event_window` reports moves at these same four horizons. Yahoo's
 module could reach `30s` at no date and `1m` only inside the last 30 days;
-IBKR's tool reaches `30s` at any date subject to actual data coverage, which
-is the entire reason it exists. When both a Yahoo-backed number and an
+IBKR's tool can reach older 30-second history when the selected contract
+actually has coverage. When both a Yahoo-backed number and an
 IBKR-backed number exist for the same event, prefer the IBKR one and say so,
 since it is measured rather than coarsened.
 
 ## `rth` versus `eth`
 
-Every bar carries a `session` field, `rth` (regular trading hours) or `eth`
-(extended, meaning pre-market and after-hours). News that lands before
-the 09:30 US Eastern open or after the 16:00 close needs `eth` bars to see
-the market's first reaction; `rth`-only bars would show nothing until the
-next open, hours late. Pass `session` explicitly when the event time is
-outside 09:30 to 16:00 US Eastern. `ibkr_event_window` defaults to including
-both, tagged, so the caller decides which to read rather than the tool
-deciding for them.
+For legacy US-equity event rows, `rth` means a bar starting inside 09:30–16:00
+US Eastern and `eth` labels pre-market or after-hours rows. News outside the
+regular session needs an all-hours fetch to observe the first reaction.
+
+On the generalized historical interface, the `session` argument describes the
+IBKR request mode: `rth` sets `useRTH=true`, while `eth` sets `useRTH=false` and
+includes every available hour, regular hours included. It is not an
+after-hours-only filter. Do not discard a regular-hours row merely because it
+came from an `eth` request; use timestamps and the instrument's calendar when
+the analysis needs clock-based classification.
 
 ## Verified retention facts
 
@@ -67,5 +69,6 @@ None of this is a promise for every symbol. IBKR's true per-contract limit is
 and it varies by name. **Verify per contract with `ibkr_data_coverage`
 before promising a date range to a person**, especially at 30-second
 resolution and especially for a name not yet tested. Treat the numbers above
-as evidence the documented ceiling is wrong rather than as a new ceiling to trust
-blindly in its place.
+as observations for the tested equity, not a new retention promise. Options
+have much shorter, contract-specific histories; check the exact `con_id` and
+data type.

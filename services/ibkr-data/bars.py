@@ -185,7 +185,9 @@ def _num(value, default=0.0):
 
 
 def bars_to_rows(bars, symbol: str, interval: str, pulled_ts: int,
-                 requested_session: str = "rth", source: str = "ibkr") -> list[dict]:
+                 requested_session: str = "rth", source: str = "ibkr",
+                 instrument_timezone: str | None = None,
+                 preserve_requested_session: bool = False) -> list[dict]:
     """IBKR ``BarData`` objects (or plain dicts) to canonical ROW dicts.
 
     Only attribute reads happen here, so nothing imports ``ib_async``. Rows come
@@ -194,13 +196,19 @@ def bars_to_rows(bars, symbol: str, interval: str, pulled_ts: int,
     """
     canon = normalize_interval(interval)
     sym = str(symbol).upper()
+    zone = MARKET_TZ
+    if instrument_timezone:
+        try:
+            zone = ZoneInfo(instrument_timezone)
+        except Exception:
+            zone = UTC
     out: dict[int, dict] = {}
     for bar in bars or []:
         get = bar.get if isinstance(bar, dict) else (lambda k, d=None, b=bar: getattr(b, k, d))
         raw_date = get("date", None)
         if raw_date is None:
             continue
-        ts = to_epoch(raw_date)
+        ts = to_epoch(raw_date, assume_tz=zone)
         out[ts] = {
             "ts": ts,
             "symbol": sym,
@@ -212,10 +220,15 @@ def bars_to_rows(bars, symbol: str, interval: str, pulled_ts: int,
             "volume": _num(get("volume", 0.0)),
             "wap": _num(get("average", get("wap", 0.0))),
             "bar_count": int(_num(get("barCount", get("bar_count", -1)), -1)),
-            "session": session_of(ts, canon, requested_session),
+            "session": (requested_session if preserve_requested_session else
+                        session_of(ts, canon, requested_session)),
             "source": str(source),
             "pulled_ts": int(pulled_ts),
         }
+        if instrument_timezone:
+            out[ts]["session_date"] = dt.datetime.fromtimestamp(ts, UTC).astimezone(zone).date().isoformat()
+            out[ts]["date_anchor"] = (f"exchange_midnight:{getattr(zone, 'key', str(zone))}"
+                                      if not is_intraday(canon) else "bar_start_utc")
     return [out[k] for k in sorted(out)]
 
 

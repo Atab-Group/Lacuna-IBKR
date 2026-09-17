@@ -1,9 +1,9 @@
 # IBKR market data for AI agents
 
 Read-only market data from Interactive Brokers, wired into Claude Code as an
-MCP server plus four skills. Historical bars down to 30-second resolution
-going years back, event windows around a dated announcement, and a local
-parquet store so the same question costs nothing the second time.
+MCP server plus four skills. It covers equities and precise contracts,
+option-chain discovery, delayed quotes and option Greeks, historical trade and
+quote bars, captured option snapshots, event windows, and a local parquet store.
 
 **It never places a trade.** There is no order code in this repository. The
 refusal sits at three layers: no order tool exists on the MCP surface, the
@@ -24,8 +24,12 @@ read-only secondary username that cannot trade at all.
 - **An authenticator app enrolled with IBKR.** The login asks for a six digit
   code, about once a week.
 
-Historical bars need no market data subscription. Nothing here requires a paid
-data feed.
+Live testing on one read-only account returned delayed equity and option quotes,
+model Greeks, open interest and historical bars without buying another feed.
+That is not a billing guarantee for every account, exchange or instrument. The
+capabilities tool reports the implemented matrix and can probe gateway
+connectivity, but it does not audit entitlements. Actual data responses remain
+the evidence for a particular contract and field.
 
 ## Installing it
 
@@ -84,14 +88,17 @@ account lockout sits directly behind the throttle.
 
 ## Using it
 
-From Claude Code, in plain language: "what did Apple do the day of the ruling",
-"how did it move in the hour after the open on 3 March", "how far back do we
-have prices for this name".
+From Claude Code, ask in plain language: "what did Apple do the day of the
+ruling", "show the next four AAPL option expiries around spot", "capture delayed
+quotes and model Greeks for these contracts", or "give me five-minute bid and
+ask bars for this option conId".
 
 From a shell:
 
 ```
 .venv/bin/python services/ibkr-data/cli.py bars AAPL --interval 1d --start 2026-08-01
+.venv/bin/python services/ibkr-data/cli.py chain AAPL --max-contracts 20
+.venv/bin/python services/ibkr-data/cli.py quote --con-id 922317899
 .venv/bin/python services/ibkr-data/cli.py coverage AAPL
 ```
 
@@ -103,7 +110,7 @@ From a shell:
 The stdio server in `.mcp.json` is found relative to the folder Claude was
 started in, so a session opened anywhere else in the filesystem gets no market
 data, and Claude Cowork, which never starts in this clone, cannot reach it at
-all. The HTTP front end fixes both: the same nine tools on a local port that a
+all. The HTTP front end fixes both: the same tools on a local port that a
 client reaches by URL and token.
 
 `setup.sh` does all of this for you. By hand it is:
@@ -141,7 +148,13 @@ Check it at any time, with no key needed:
 curl http://127.0.0.1:8770/healthz
 ```
 
-## The pacing limit
+## Storage and pacing
+
+The v2 store keys bars by contract, data type, session and interval. Trade,
+bid, ask and separate option strikes therefore cannot overwrite one another.
+The old stock trade cache remains readable. Set `LACUNA_IBKR_ROOT` consistently
+when several clients must use one existing cache, and `LACUNA_IBKR_UNIVERSE`
+when they must share a watchlist.
 
 IBKR allows **60 historical requests per rolling 10 minutes**, and BID_ASK
 requests count twice. The service enforces that budget locally and shares it
@@ -165,9 +178,22 @@ against what actually came back. Read that block, never the row count.
 - **60 requests per 10 minutes is a hard ceiling.** A seven-year daily backfill
   across thirty names is roughly 250 requests, so it takes the better part of
   an hour. Run it detached.
-- **Live streaming quotes are delayed** on an account with no market data
-  subscription, so `ibkr_get_quote` can be minutes stale. Historical bars carry
-  no such discount.
+- **Quotes report the data mode actually returned.** On an account without the
+  relevant live subscription this is commonly delayed. Collection time is not
+  an exchange timestamp or a measured lag. Some fields can remain unavailable
+  while other delayed values are usable.
+- **IBKR does not provide a historical strike-level IV/Greek surface here.**
+  `OPTION_IMPLIED_VOLATILITY` is an underlying-level historical series. Capture
+  option snapshots repeatedly to build local strike-level history from now on;
+  no schedule is enabled automatically.
+- **Direct daily option and futures-option bars are unavailable.** Use supported
+  intraday trade or quote bars. Any daily aggregate must be derived from
+  adequate coverage and labelled as derived.
+- **Continuous futures are current-window series.** IBKR rejects explicit end
+  times for `CONTFUT`, so the service cannot use them for arbitrary dated
+  backfills.
+- **A missing option trade bar does not prove the market was closed.** Illiquid
+  options can have quote bars without a trade in the same interval.
 - **30-second bars have a shorter reach than minute bars.** Retention varies per
   contract, and `reqHeadTimeStamp` is the only honest answer for a name you have
   not pulled before.

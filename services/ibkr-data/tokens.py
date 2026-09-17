@@ -52,6 +52,8 @@ def load_tokens(path):
             data = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return []
+    if not isinstance(data, dict):
+        return []
     entries = data.get("tokens")
     if not isinstance(entries, list):
         return []

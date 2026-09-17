@@ -1,7 +1,7 @@
 {
   "name": "ibkr",
-  "description": "Read-only Interactive Brokers market data for AI agents: historical bars down to 30-second resolution, event windows around a timestamp, and a local parquet store, plus setup, login, status and market-data skills. It reaches the service over a local address, so it works from any folder and inside Cowork, not only in the folder holding the clone. It cannot place an order.",
-  "version": "0.4.0",
+  "description": "Read-only Interactive Brokers market data for AI agents: equities, options, delayed quotes and Greeks, historical bars, option snapshot capture, event windows, and a local parquet store. It cannot place an order.",
+  "version": "0.5.0",
   "author": {
     "name": "Lacuna"
   },

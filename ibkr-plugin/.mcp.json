@@ -4,7 +4,7 @@
       "type": "http",
       "url": "${user_config.ibkr_url}",
       "title": "IBKR market data",
-      "description": "Historical bars, event windows and coverage from a local read-only Interactive Brokers store. It cannot place an order.",
+      "description": "Read-only IBKR contracts, option chains, delayed quotes and Greeks, historical bars, captured option snapshots, event windows and coverage. It cannot place an order.",
       "headers": {
         "Authorization": "Bearer ${user_config.ibkr_token}"
       }

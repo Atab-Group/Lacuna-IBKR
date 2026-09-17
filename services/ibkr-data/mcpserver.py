@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ibkr-data MCP server: nine tools over the bar store and the gateway.
+"""ibkr-data MCP server: read-only market-data tools over the store and gateway.
 
 Transport is stdio, one JSON-RPC message per line, hand-rolled the same way
 ``services/notification-hub/mcpserver.py`` hand-rolls Streamable HTTP. The
@@ -47,7 +47,7 @@ import jobs                      # noqa: E402
 import store                     # noqa: E402
 
 SERVER_NAME = "ibkr-data"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 # Protocol revisions this server speaks, modern first. Same list as the
 # notification-hub server, for the same reason: clients in the wild lag.
@@ -317,6 +317,9 @@ def universe_path(root_dir=None) -> Path:
     a file dropped in the store root wins over the shipped one so a deployment can
     carry its own list.
     """
+    configured = os.environ.get("LACUNA_IBKR_UNIVERSE")
+    if configured:
+        return Path(configured)
     if root_dir is not None:
         return store.root(root_dir) / UNIVERSE
     in_store = store.root() / UNIVERSE
@@ -459,20 +462,24 @@ def tool_resolve_contract(args, ctx=None) -> dict:
     """Ticker to conId, from the cache when it can and the gateway when it must."""
     ctx = ctx or DEFAULT_CTX
     try:
-        query = need_symbol(args, "query") if args.get("query") else need_symbol(args)
+        spec = _selector_from_args(args)
+        query = str(spec.get("symbol") or spec.get("con_id") or "")
+        if not query:
+            raise ValueError("query, symbol or con_id is required")
     except ValueError as exc:
-        return bad_argument(str(exc), "Pass query as a ticker, such as NSRGY.")
+        return bad_argument(str(exc), "Pass a ticker or exact contract selector.")
     refresh = bool(args.get("refresh"))
 
     cache = contractlib.load(ctx.root_dir)
-    if not refresh and cache.get(query, {}).get("con_id"):
-        return {"contract": cache[query], "source": "cache"}
+    key = contractlib.cache_key(spec)
+    if not refresh and cache.get(key, {}).get("con_id"):
+        return {"contract": cache[key], "source": "cache"}
 
     client = None
     try:
         client = ctx.connect()
     except Exception as exc:
-        cached = cache.get(query)
+        cached = cache.get(key)
         if cached:
             return {"contract": cached, "source": "cache",
                     "note": f"refresh asked for, but the gateway is down ({exc}); "
@@ -480,8 +487,8 @@ def tool_resolve_contract(args, ctx=None) -> dict:
         return gateway_down(str(exc), symbol=query)
 
     try:
-        contract = contractlib.resolve(query, client=client, root_dir=ctx.root_dir,
-                                       refresh=refresh, now=int(ctx.now()))
+        contract = contractlib.resolve_selector(spec, client=client, root_dir=ctx.root_dir,
+                                                refresh=refresh, now=int(ctx.now()))
     except LookupError as exc:
         return fail("unresolvable_symbol", str(exc),
                     "Ask the user which listing they mean, then call this tool "
@@ -494,7 +501,25 @@ def tool_resolve_contract(args, ctx=None) -> dict:
     return {"contract": contract, "source": "gateway"}
 
 
-def _serve_bars(symbol, interval, start_ts, end_ts, session, allow_fetch, ctx):
+def _selector_from_args(args, default_sec_type="STK"):
+    keys = ("con_id", "symbol", "query", "sec_type", "exchange", "currency",
+            "primary_exchange", "expiry", "strike", "right", "multiplier",
+            "trading_class", "local_symbol")
+    values = {k: args.get(k) for k in keys if args.get(k) not in (None, "")}
+    if not values.get("con_id"):
+        values.setdefault("sec_type", default_sec_type)
+    return contractlib.selector(**values)
+
+
+def _resolve_selector(args, client, ctx, default_sec_type="STK"):
+    return contractlib.resolve_selector(_selector_from_args(args, default_sec_type),
+                                        client=client, root_dir=ctx.root_dir,
+                                        refresh=bool(args.get("refresh")),
+                                        now=int(ctx.now()))
+
+
+def _serve_bars(symbol, interval, start_ts, end_ts, session, allow_fetch, ctx,
+                contract=None, data_type="TRADES"):
     """One ensure_bars call, with the gateway opened only when it is needed."""
     client = None
     gateway_note = None
@@ -508,7 +533,7 @@ def _serve_bars(symbol, interval, start_ts, end_ts, session, allow_fetch, ctx):
         result = jobs.ensure_bars(symbol, interval, start_ts, end_ts, session=session,
                                   allow_fetch=allow_fetch and client is not None,
                                   client=client, root_dir=ctx.root_dir,
-                                  now=ctx.now())
+                                  now=ctx.now(), contract=contract, what=data_type)
     finally:
         _close(client)
     if gateway_note:
@@ -521,7 +546,9 @@ def tool_get_bars(args, ctx=None) -> dict:
     """Bars for a window, fetching what the store is missing."""
     ctx = ctx or DEFAULT_CTX
     try:
-        symbol = need_symbol(args)
+        symbol = str(args.get("symbol") or args.get("query") or "").strip().upper()
+        if not symbol and not args.get("con_id"):
+            raise ValueError("symbol or con_id is required")
         interval = barlib.normalize_interval(args.get("interval") or "1d")
         session = read_session(args)
         if not args.get("start"):
@@ -529,6 +556,11 @@ def tool_get_bars(args, ctx=None) -> dict:
         start_ts = barlib.to_epoch(args["start"])
         end_ts = (barlib.to_epoch(args["end"]) if args.get("end")
                   else int(ctx.now()))
+        data_type = str(args.get("data_type") or "TRADES").upper()
+        allowed = {"TRADES", "BID", "ASK", "MIDPOINT", "BID_ASK", "ADJUSTED_LAST",
+                   "HISTORICAL_VOLATILITY", "OPTION_IMPLIED_VOLATILITY"}
+        if data_type not in allowed:
+            raise ValueError(f"unsupported data_type {data_type!r}")
     except (ValueError, TypeError, barlib.IntervalError) as exc:
         return bad_argument(str(exc),
                             "Fix the argument and call again. Timestamps are ISO "
@@ -540,13 +572,35 @@ def tool_get_bars(args, ctx=None) -> dict:
     allow_fetch = args.get("allow_fetch")
     allow_fetch = True if allow_fetch is None else bool(allow_fetch)
 
-    result = _serve_bars(symbol, interval, start_ts, end_ts, session, allow_fetch, ctx)
+    contract = None
+    exact_keys = ("con_id", "sec_type", "exchange", "currency", "primary_exchange",
+                  "expiry", "strike", "right", "multiplier", "trading_class", "local_symbol")
+    if any(args.get(k) not in (None, "") for k in exact_keys) or data_type != "TRADES":
+        client = None
+        try:
+            if allow_fetch:
+                client = ctx.connect()
+            contract = contractlib.resolve_selector(_selector_from_args(args), client=client,
+                                                    root_dir=ctx.root_dir,
+                                                    now=int(ctx.now()))
+            symbol = contract["symbol"]
+        except LookupError as exc:
+            return fail("contract_not_cached", str(exc),
+                        "Resolve this contract with the gateway available, then retry cache-only.")
+        except Exception as exc:
+            return gateway_down(str(exc), selector=_selector_from_args(args))
+        finally:
+            _close(client)
+    result = _serve_bars(symbol, interval, start_ts, end_ts, session, allow_fetch, ctx,
+                         contract=contract, data_type=data_type)
     rows, dropped = trim_bars(result["rows"], args.get("max_bars"))
 
     payload = {
         "symbol": result["symbol"],
         "interval": result["interval"],
         "session": result["session"],
+        "contract": result.get("contract"),
+        "data_type": result.get("data_type", data_type),
         "bars": rows,
         "n_returned": len(rows),
         "coverage": result["coverage"],
@@ -877,20 +931,180 @@ def tool_query_sql(args, ctx=None) -> dict:
 
 
 def tool_get_quote(args, ctx=None) -> dict:
-    """The v2 stub. A structured answer, never an error."""
-    symbol = str(args.get("symbol") or "").strip().upper()
-    return {
-        "symbol": symbol or None,
-        "quote": None,
-        "status": "not_collected",
-        "available_in": "v2",
-        "why": ("this service collects historical bars only. Live and delayed "
-                "snapshots need a market data subscription this account does "
-                "not hold, and the decision to buy one waits on a case that "
-                "needs sub-day monitoring."),
-        "next_action": ("Use ibkr_get_bars or ibkr_event_window; the most recent "
-                        "bar is the freshest price this service has."),
-    }
+    """A bounded delayed quote, preserving partial fields and warnings."""
+    ctx = ctx or DEFAULT_CTX
+    if not (args.get("symbol") or args.get("query") or args.get("con_id")):
+        return bad_argument("symbol, query or con_id is required",
+                            "Pass a ticker or an exact contract selector.")
+    try:
+        timeout = float(args.get("timeout_seconds") or 8)
+        if timeout < 0.25 or timeout > 20:
+            raise ValueError("timeout_seconds must be between 0.25 and 20")
+    except (TypeError, ValueError) as exc:
+        return bad_argument(str(exc), "Fix timeout_seconds and retry.")
+    client = None
+    try:
+        client = ctx.connect()
+        contract = _resolve_selector(args, client, ctx)
+        rows = client.market_snapshot([contract], timeout=timeout)
+        return {"contract": contract, "quote": rows[0] if rows else None,
+                "status": rows[0]["status"] if rows else "unavailable",
+                "source": "ibkr", "delayed_requested": True}
+    except (LookupError, ValueError) as exc:
+        return bad_argument(str(exc), "Pass an exact contract selector or con_id.")
+    except Exception as exc:
+        return gateway_down(str(exc), selector=_selector_from_args(args))
+    finally:
+        _close(client)
+
+
+def _option_contracts(args, client, ctx):
+    underlying_args = {"symbol": args.get("underlying") or args.get("symbol") or args.get("query"),
+                       "sec_type": args.get("underlying_sec_type") or "STK",
+                       "exchange": args.get("underlying_exchange") or "SMART",
+                       "currency": args.get("currency") or "USD"}
+    underlying = contractlib.resolve_selector(underlying_args, client=client,
+                                              root_dir=ctx.root_dir, now=int(ctx.now()))
+    params = client.option_parameters(underlying)
+    preferred = next((p for p in params if p["exchange"] == "SMART"), params[0] if params else None)
+    if not preferred:
+        return underlying, params, []
+    expiries = [args["expiry"]] if args.get("expiry") else preferred["expirations"]
+    strikes = preferred["strikes"]
+    if args.get("strikes"):
+        strikes = [float(x) for x in args["strikes"]]
+    lo, hi = args.get("strike_min"), args.get("strike_max")
+    if lo is not None: strikes = [x for x in strikes if x >= float(lo)]
+    if hi is not None: strikes = [x for x in strikes if x <= float(hi)]
+    rights = [str(args.get("right")).upper()] if args.get("right") else ["C", "P"]
+    rights = [{"CALL": "C", "PUT": "P"}.get(x, x) for x in rights]
+    cap = min(max(int(args.get("max_contracts") or 100), 1), 500)
+    candidates = []
+    for expiry in expiries:
+        for strike in strikes:
+            for right in rights:
+                candidates.append({"symbol": underlying["symbol"], "sec_type": "OPT",
+                    "exchange": args.get("exchange") or "SMART", "currency": underlying["currency"],
+                    "expiry": expiry, "strike": strike, "right": right,
+                    "multiplier": preferred["multiplier"],
+                    "trading_class": preferred["trading_class"]})
+                if len(candidates) >= cap: break
+            if len(candidates) >= cap: break
+        if len(candidates) >= cap: break
+    qualified = []
+    if args.get("qualify") is not False:
+        for candidate in candidates:
+            rows = client.resolve_contract(candidate)
+            if rows:
+                item = rows[0]
+                item["resolved_ts"] = int(ctx.now())
+                qualified.append(item)
+    else:
+        qualified = candidates
+    return underlying, params, qualified
+
+
+def tool_option_chain(args, ctx=None) -> dict:
+    ctx = ctx or DEFAULT_CTX
+    if not (args.get("underlying") or args.get("symbol") or args.get("query")):
+        return bad_argument("underlying is required", "Pass underlying such as AAPL.")
+    client = None
+    try:
+        client = ctx.connect()
+        underlying, params, contracts = _option_contracts(args, client, ctx)
+        return {"underlying": underlying, "parameters": params, "contracts": contracts,
+                "n_contracts": len(contracts), "qualified": args.get("qualify") is not False,
+                "bounded": True}
+    except Exception as exc:
+        return gateway_down(str(exc), underlying=args.get("underlying"))
+    finally:
+        _close(client)
+
+
+def _snapshot_contracts(args, client, ctx):
+    raw = args.get("contracts")
+    if raw:
+        cap = min(max(int(args.get("max_contracts") or 20), 1), 100)
+        return [contractlib.resolve_selector(x, client=client, root_dir=ctx.root_dir,
+                                             now=int(ctx.now())) for x in raw[:cap]]
+    chain_args = dict(args)
+    chain_args["max_contracts"] = min(int(args.get("max_contracts") or 20), 100)
+    _underlying, _params, contracts = _option_contracts(chain_args, client, ctx)
+    return contracts
+
+
+def tool_option_snapshot(args, ctx=None, capture=False) -> dict:
+    ctx = ctx or DEFAULT_CTX
+    try:
+        cap = int(args.get("max_contracts") or 20)
+        timeout = float(args.get("timeout_seconds") or 8)
+        if cap < 1 or cap > 100:
+            raise ValueError("max_contracts must be between 1 and 100")
+        if timeout < 0.25 or timeout > 20:
+            raise ValueError("timeout_seconds must be between 0.25 and 20")
+        if not args.get("contracts") and not (args.get("underlying") or args.get("symbol")):
+            raise ValueError("contracts or underlying is required")
+    except (TypeError, ValueError) as exc:
+        return bad_argument(str(exc), "Fix the bounded snapshot arguments and retry.")
+    client = None
+    try:
+        client = ctx.connect()
+        contracts = _snapshot_contracts(args, client, ctx)
+        rows = client.market_snapshot(contracts, timeout=timeout)
+        written = store.write_snapshots(rows, ctx.root_dir) if capture and rows else {}
+        return {"snapshots": rows, "n_snapshots": len(rows), "source": "ibkr",
+                "delayed_requested": True, "written": written}
+    except (LookupError, ValueError) as exc:
+        return bad_argument(str(exc), "Pass exact option contracts or a bounded chain selector.")
+    except Exception as exc:
+        return gateway_down(str(exc))
+    finally:
+        _close(client)
+
+
+def tool_capture_option_snapshots(args, ctx=None) -> dict:
+    return tool_option_snapshot(args, ctx, capture=True)
+
+
+def tool_get_option_snapshots(args, ctx=None) -> dict:
+    """Read previously captured option snapshots without touching the gateway."""
+    ctx = ctx or DEFAULT_CTX
+    try:
+        con_id = int(args["con_id"])
+        limit = min(max(int(args.get("limit") or 1000), 1), 5000)
+        rows = store.read_snapshots(con_id, args.get("start"), args.get("end"), ctx.root_dir)
+    except (KeyError, TypeError, ValueError) as exc:
+        return bad_argument(str(exc), "Pass con_id and optional ISO start/end with limit 1-5000.")
+    dropped = max(0, len(rows) - limit)
+    payload = {"con_id": con_id, "snapshots": rows[:limit],
+               "n_returned": min(len(rows), limit), "source": "cache"}
+    if dropped:
+        payload["truncated"] = dropped
+    return payload
+
+
+def tool_market_data_capabilities(args, ctx=None) -> dict:
+    ctx = ctx or DEFAULT_CTX
+    payload = {"server_version": SERVER_VERSION, "read_only": True,
+        "asset_types": ["STK", "OPT", "IND", "CASH", "FUT", "CONTFUT", "FOP"],
+        "historical_data_types": ["TRADES", "BID", "ASK", "MIDPOINT", "BID_ASK",
+          "ADJUSTED_LAST", "HISTORICAL_VOLATILITY", "OPTION_IMPLIED_VOLATILITY"],
+        "delayed_snapshots": True, "option_chain": True, "option_daily_bars": False,
+        "option_daily_note": "IBKR rejects direct option EOD bars; request intraday bars.",
+        "continuous_future_note": "CONTFUT history is limited to one current-window chunk because IBKR rejects explicit end times.",
+        "adjusted_last_note": "ADJUSTED_LAST fetches one bounded window from now through the requested start because IBKR requires an empty end time, then filters to the requested dates.",
+        "snapshot_history": True, "trading": False}
+    if args.get("probe"):
+        client = None
+        try:
+            client = ctx.connect(timeout=5)
+            payload["gateway"] = {"up": True, "server_version": client.server_version(),
+                                  "accounts": client.accounts()}
+        except Exception as exc:
+            payload["gateway"] = {"up": False, "detail": str(exc)}
+        finally:
+            _close(client)
+    return payload
 
 
 TOOL_HANDLERS = {
@@ -903,6 +1117,11 @@ TOOL_HANDLERS = {
     "ibkr_data_coverage": tool_data_coverage,
     "ibkr_query_sql": tool_query_sql,
     "ibkr_get_quote": tool_get_quote,
+    "ibkr_option_chain": tool_option_chain,
+    "ibkr_option_snapshot": tool_option_snapshot,
+    "ibkr_capture_option_snapshots": tool_capture_option_snapshots,
+    "ibkr_get_option_snapshots": tool_get_option_snapshots,
+    "ibkr_market_data_capabilities": tool_market_data_capabilities,
 }
 
 
@@ -912,11 +1131,22 @@ TOOL_HANDLERS = {
 
 _INTERVAL_ENUM = ["30s", "1m", "5m", "15m", "30m", "1h", "1d"]
 _TS_DESC = "ISO 8601 UTC, such as 2026-06-25T14:00:00Z."
-_SESSION_DESC = ("rth is 09:30 to 16:00 US/Eastern; eth is everything else, "
-                 "which is where a pre-market announcement lands. Every bar carries "
-                 "its own session so a pre-market print is never compared "
-                 "against a close.")
+_SESSION_DESC = ("For legacy US equities, rth is 09:30-16:00 US/Eastern and eth "
+                 "selects bars outside it. For generalized instruments this is the "
+                 "IBKR useRTH dataset: rth requests regular hours; eth requests all "
+                 "hours and can include regular-hour bars.")
 _DURATION_DESC = "A duration such as 30s, 15m, 2h or 3d, or plain seconds."
+_DATA_TYPES = ["TRADES", "BID", "ASK", "MIDPOINT", "BID_ASK", "ADJUSTED_LAST",
+               "HISTORICAL_VOLATILITY", "OPTION_IMPLIED_VOLATILITY"]
+_SELECTOR_PROPERTIES = {
+    "symbol": {"type": "string"}, "query": {"type": "string"},
+    "con_id": {"type": "integer"},
+    "sec_type": {"type": "string", "enum": ["STK", "OPT", "IND", "CASH", "FUT", "CONTFUT", "FOP"]},
+    "exchange": {"type": "string"}, "currency": {"type": "string"},
+    "primary_exchange": {"type": "string"}, "expiry": {"type": "string"},
+    "strike": {"type": "number"}, "right": {"type": "string", "enum": ["C", "P", "CALL", "PUT"]},
+    "multiplier": {"type": "string"}, "trading_class": {"type": "string"},
+}
 
 TOOLS = [
     {
@@ -954,11 +1184,11 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "A ticker, such as NSRGY or MSFT."},
+                **_SELECTOR_PROPERTIES,
                 "refresh": {"type": "boolean", "description":
                             "Ignore the cache and ask the gateway again."},
             },
-            "required": ["query"],
+            "required": [],
         },
     },
     {
@@ -975,6 +1205,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "symbol": {"type": "string", "description": "Ticker, such as MSFT."},
+                **_SELECTOR_PROPERTIES,
+                "data_type": {"type": "string", "enum": _DATA_TYPES},
                 "interval": {"type": "string", "enum": _INTERVAL_ENUM,
                              "description": "Bar size. Default 1d."},
                 "start": {"type": "string", "description": "Window start. " + _TS_DESC},
@@ -989,7 +1221,7 @@ TOOLS = [
                              f"Bars to return before the tail is trimmed. Default "
                              f"{DEFAULT_MAX_BARS}; coverage always counts all of them."},
             },
-            "required": ["symbol", "start"],
+            "required": ["start"],
         },
     },
     {
@@ -1104,27 +1336,71 @@ TOOLS = [
         "name": "ibkr_get_quote",
         "title": "Get a quote",
         "description": (
-            "The live snapshot tool, not collected yet and planned for v2; it "
-            "always answers with a structured not_collected record explaining "
-            "that this account holds no market data subscription, and points at "
-            "ibkr_get_bars, whose most recent bar is the freshest price this "
-            "service has."),
+            "A bounded delayed quote for an exact stock, option, index, FX or futures "
+            "contract. Partial fields and IBKR entitlement warnings are preserved."),
         "inputSchema": {
             "type": "object",
-            "properties": {"symbol": {"type": "string", "description": "Ticker."}},
+            "properties": {**_SELECTOR_PROPERTIES,
+                           "timeout_seconds": {"type": "number", "minimum": 0.25, "maximum": 20}},
             "required": [],
         },
+    },
+    {
+        "name": "ibkr_option_chain", "title": "Discover an option chain",
+        "description": "Discover expirations and strikes and optionally qualify a bounded set of exact option contracts.",
+        "inputSchema": {"type": "object", "properties": {
+            "underlying": {"type": "string"}, "expiry": {"type": "string"},
+            "strikes": {"type": "array", "items": {"type": "number"}},
+            "strike_min": {"type": "number"}, "strike_max": {"type": "number"},
+            "right": {"type": "string", "enum": ["C", "P", "CALL", "PUT"]},
+            "max_contracts": {"type": "integer", "minimum": 1, "maximum": 500},
+            "qualify": {"type": "boolean"}, "currency": {"type": "string"},
+            "exchange": {"type": "string"}}, "required": ["underlying"]},
+    },
+    {
+        "name": "ibkr_option_snapshot", "title": "Get delayed option snapshots",
+        "description": "Collect delayed quotes, sizes, model and quote Greeks, volume and open interest for at most 100 exact options.",
+        "inputSchema": {"type": "object", "properties": {
+            "contracts": {"type": "array", "items": {"type": "object"}},
+            "underlying": {"type": "string"}, "expiry": {"type": "string"},
+            "strikes": {"type": "array", "items": {"type": "number"}},
+            "right": {"type": "string"}, "max_contracts": {"type": "integer", "maximum": 100},
+            "timeout_seconds": {"type": "number", "minimum": 0.25, "maximum": 20}}, "required": []},
+    },
+    {
+        "name": "ibkr_capture_option_snapshots", "title": "Capture option snapshots",
+        "description": "Collect the same bounded delayed option snapshot and retain it in parquet for future historical research.",
+        "inputSchema": {"type": "object", "properties": {
+            "contracts": {"type": "array", "items": {"type": "object"}},
+            "underlying": {"type": "string"}, "expiry": {"type": "string"},
+            "strikes": {"type": "array", "items": {"type": "number"}},
+            "right": {"type": "string"}, "max_contracts": {"type": "integer", "maximum": 100},
+            "timeout_seconds": {"type": "number", "minimum": 0.25, "maximum": 20}}, "required": []},
+    },
+    {
+        "name": "ibkr_get_option_snapshots", "title": "Read captured option snapshots",
+        "description": "Read retained delayed quote, Greek and open-interest snapshots for one option conId without touching IBKR.",
+        "inputSchema": {"type": "object", "properties": {
+            "con_id": {"type": "integer"}, "start": {"type": "string"},
+            "end": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 5000}},
+            "required": ["con_id"]},
+    },
+    {
+        "name": "ibkr_market_data_capabilities", "title": "Market data capabilities",
+        "description": "Report supported asset and historical data types, option limitations and the read-only safety boundary; optionally probe the gateway.",
+        "inputSchema": {"type": "object", "properties": {"probe": {"type": "boolean"}}, "required": []},
     },
 ]
 
 TOOL_NAMES = [t["name"] for t in TOOLS]
 
 INSTRUCTIONS = (
-    "Read-only market data from Interactive Brokers: historical "
-    "bars cached in a local parquet store and served "
+    "Read-only market data from Interactive Brokers for stocks, options, indexes, "
+    "FX, futures and futures options: delayed quotes and option Greeks, option-chain "
+    "discovery, retained snapshots, and historical bars cached in parquet and served "
     "with a coverage block that states what was asked for against what actually "
-    "exists. Reach for it for any question about what a listed stock did at or "
-    "around a moment in time. Nothing here can place an "
+    "exists. Reach for it for contract discovery, semi-live observations, historical "
+    "series, or what an instrument did around a moment in time. Nothing here can place an "
     "order.\n\n"
     "Three things to know before the first call. Timestamps in and out are ISO "
     "8601 UTC. A breached pacing limit makes IBKR answer with silence rather "
@@ -1133,9 +1409,10 @@ INSTRUCTIONS = (
     "roughly weekly: when it is down, ibkr_status returns the login URL, the "
     "cached bars still serve, and a login must never be retried "
     "programmatically.\n\n"
-    "Start at ibkr_status when anything misbehaves, ibkr_resolve_contract for a "
-    "ticker you have not pulled before (ADRs like NSRGY need it), then "
-    "ibkr_event_window for a dated event or ibkr_get_bars for a plain window."
+    "Start at ibkr_status or ibkr_market_data_capabilities, use "
+    "ibkr_resolve_contract for an exact identity, ibkr_option_chain for bounded "
+    "option discovery, ibkr_get_quote or ibkr_option_snapshot for delayed data, and "
+    "ibkr_event_window or ibkr_get_bars for historical windows."
 )
 
 

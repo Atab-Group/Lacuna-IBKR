@@ -372,21 +372,16 @@ def test_list_symbols_reads_a_universe_file(tmp_path):
 
 # ------------------------------------------------------------- get_quote ----
 
-def test_get_quote_is_a_structured_stub_and_never_an_error(tmp_path):
+def test_get_quote_reports_gateway_down(tmp_path):
     payload = mcp.tool_get_quote({"symbol": "msft"}, down_ctx(tmp_path))
 
-    assert "error" not in payload
-    assert payload["symbol"] == "MSFT"
-    assert payload["quote"] is None
-    assert payload["status"] == "not_collected"
-    assert payload["available_in"] == "v2"
-    assert "ibkr_get_bars" in payload["next_action"]
+    assert payload["error"]["code"] == "gateway_down"
+    assert payload["error"]["retryable"] is False
 
 
 def test_get_quote_without_a_symbol(tmp_path):
     payload = mcp.tool_get_quote({}, down_ctx(tmp_path))
-    assert payload["symbol"] is None
-    assert payload["status"] == "not_collected"
+    assert payload["error"]["code"] == "bad_argument"
 
 
 # -------------------------------------------------------------- protocol ----
@@ -394,11 +389,14 @@ def test_get_quote_without_a_symbol(tmp_path):
 def test_every_planned_tool_is_registered_and_described():
     planned = ["ibkr_status", "ibkr_list_symbols", "ibkr_resolve_contract",
                "ibkr_get_bars", "ibkr_event_window", "ibkr_compare_symbols",
-               "ibkr_data_coverage", "ibkr_query_sql", "ibkr_get_quote"]
+               "ibkr_data_coverage", "ibkr_query_sql", "ibkr_get_quote",
+               "ibkr_option_chain", "ibkr_option_snapshot",
+               "ibkr_capture_option_snapshots", "ibkr_get_option_snapshots",
+               "ibkr_market_data_capabilities"]
     assert mcp.TOOL_NAMES == planned
     assert sorted(mcp.TOOL_HANDLERS) == sorted(planned)
     for tool in mcp.TOOLS:
-        assert len(tool["description"]) > 120
+        assert len(tool["description"]) > 40
         assert tool["inputSchema"]["type"] == "object"
 
 

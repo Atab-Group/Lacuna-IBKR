@@ -5,6 +5,7 @@ flaky. The only client is a fake that counts calls.
 """
 
 import datetime as dt
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,36 @@ ET = barlib.MARKET_TZ
 
 def et(y, m, d, hh=0, mm=0):
     return int(dt.datetime(y, m, d, hh, mm, tzinfo=ET).timestamp())
+
+
+def test_interrupted_legacy_migration_preserves_symbols_and_pacing(root):
+    root.mkdir(parents=True)
+    raw = sqlite3.connect(root / "jobs.db")
+    raw.executescript("""
+      CREATE TABLE requests (id INTEGER PRIMARY KEY, ts REAL, key TEXT, weight INTEGER);
+      INSERT INTO requests VALUES (1, 100, 'kept', 1);
+      CREATE TABLE coverage_legacy (
+        symbol TEXT, interval TEXT, date TEXT, status TEXT, n_bars INTEGER,
+        session TEXT, note TEXT, updated_ts INTEGER,
+        PRIMARY KEY(symbol,interval,date));
+      INSERT INTO coverage_legacy VALUES ('AAPL','1d','2026-09-17','ok',1,'rth','',100);
+      INSERT INTO coverage_legacy VALUES ('MSFT','1d','2026-09-17','ok',1,'rth','',100);
+      CREATE TABLE coverage (
+        con_id INTEGER, symbol TEXT, data_type TEXT, interval TEXT, session TEXT,
+        date TEXT, status TEXT, n_bars INTEGER, note TEXT, updated_ts INTEGER,
+        PRIMARY KEY(con_id,data_type,interval,session,date));
+    """)
+    raw.commit(); raw.close()
+
+    conn = jobs.open_db(root)
+    try:
+        rows = conn.execute("SELECT symbol FROM coverage ORDER BY symbol").fetchall()
+        assert [r["symbol"] for r in rows] == ["AAPL", "MSFT"]
+        assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name='coverage_legacy'").fetchone()
+    finally:
+        conn.close()
 
 
 @pytest.fixture
@@ -215,6 +246,19 @@ CONTRACT = {"symbol": "MSFT", "con_id": 1, "sec_type": "STK", "exchange": "SMART
             "resolved_ts": 0}
 
 
+def test_adjusted_last_fetches_from_now_and_filters_a_past_window(root):
+    client = FakeClient()
+    result = jobs.ensure_bars(
+        "MSFT", "1d", et(2026, 6, 1), et(2026, 6, 5), client=client,
+        root_dir=root, now=et(2026, 7, 1), contract=CONTRACT,
+        what="ADJUSTED_LAST")
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["end"] == dt.datetime.fromtimestamp(et(2026, 7, 1), dt.timezone.utc)
+    assert result["rows"] == []
+    assert result["fetch_denied"] is None
+
+
 def test_ensure_bars_serves_a_complete_cache_without_calling_the_gateway(root):
     rows = barlib.bars_to_rows(
         [SimpleNamespace(date=dt.datetime.fromtimestamp(et(2026, 6, 25, 9, 30) + 60 * i,
@@ -243,7 +287,8 @@ def test_ensure_bars_fetches_when_the_store_is_cold(root):
     assert result["coverage"]["complete"] is True
     assert result["budget"]["used"] == 1
     # and it landed on disk, in the right partition
-    assert store.partition_path("MSFT", "1m", "2026-06-25", root).exists()
+    assert store.dataset_partition_path(CONTRACT["con_id"], "1m", "2026-06-25",
+                                        "TRADES", "rth", root).exists()
 
 
 def test_a_second_call_is_served_from_the_cache(root):

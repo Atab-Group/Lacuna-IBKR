@@ -5,7 +5,7 @@ The stdio server in ``mcpserver.py`` is found by the plugin only relative to
 the folder Claude was started in (``${CLAUDE_PROJECT_DIR}``). That means a
 session opened anywhere else gets no market data at all, and Claude Cowork,
 which never starts in this clone, cannot reach it under any circumstances.
-This front end fixes both by putting the same nine tools on a local HTTP port
+This front end fixes both by putting the same market-data tools on a local HTTP port
 that a client reaches by URL and bearer token, exactly the way the two remote
 Lacuna services are already reached.
 
@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -309,6 +310,27 @@ class Server(ThreadingHTTPServer):
     def __init__(self, addr, cfg):
         self.cfg = cfg
         super().__init__(addr, Handler)
+
+    def process_request_thread(self, request, client_address):
+        """Give each connection thread the event loop ``ib_async`` expects.
+
+        ``ThreadingHTTPServer`` creates a fresh worker thread per connection,
+        while Python 3.11 no longer creates an asyncio loop implicitly in a
+        worker. Even the synchronous ib_async facade asks for that thread's
+        loop, so live market-data calls otherwise fail with ``RuntimeError``
+        before they can reach Gateway. A connection owns its loop for its
+        whole lifetime, including kept-alive requests, and closes it when the
+        worker exits.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            try:
+                loop.close()
+            finally:
+                asyncio.set_event_loop(None)
 
     def handle_error(self, request, client_address):
         # socketserver prints a traceback to stderr and carries on. Routing it

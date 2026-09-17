@@ -24,7 +24,23 @@ CACHE = "contracts.json"
 EXCHANGE_PREFERENCE = ("NYSE", "NASDAQ", "ARCA", "AMEX", "BATS", "PINK", "VALUE")
 
 FIELDS = ("symbol", "con_id", "sec_type", "exchange", "primary_exchange",
-          "currency", "long_name", "resolved_ts")
+          "currency", "long_name", "local_symbol", "expiry", "strike", "right",
+          "multiplier", "trading_class", "underlying_con_id", "time_zone",
+          "resolved_ts")
+
+
+def cache_key(contract: dict) -> str:
+    """Stable cache key. Stocks retain their historical ticker key."""
+    sec_type = str(contract.get("sec_type", "STK")).upper()
+    if contract.get("con_id"):
+        return f"CONID:{int(contract['con_id'])}"
+    if (sec_type == "STK" and str(contract.get("exchange") or "SMART").upper() == "SMART"
+            and str(contract.get("currency") or "USD").upper() == "USD"
+            and not contract.get("primary_exchange")):
+        return str(contract.get("symbol", "")).upper()
+    return "|".join(str(contract.get(k, "")).upper() for k in
+                    ("sec_type", "symbol", "expiry", "strike", "right",
+                     "exchange", "currency"))
 
 
 def cache_path(root_dir=None) -> Path:
@@ -78,7 +94,7 @@ def pick(details: list[dict], currency: str = "USD",
 
 
 def _to_contract(row: dict, now: int) -> dict:
-    return {
+    out = {
         "symbol": str(row["symbol"]).upper(),
         "con_id": int(row["con_id"]),
         "sec_type": row.get("sec_type", "STK"),
@@ -88,6 +104,71 @@ def _to_contract(row: dict, now: int) -> dict:
         "long_name": row.get("long_name", ""),
         "resolved_ts": int(now),
     }
+    for name in FIELDS:
+        if name not in out and row.get(name) not in (None, ""):
+            out[name] = row[name]
+    return out
+
+
+def selector(**values) -> dict:
+    """Normalize a general instrument selector without importing ib_async."""
+    raw = {k: v for k, v in values.items() if v not in (None, "")}
+    if raw.get("query") and not raw.get("symbol"):
+        raw["symbol"] = raw.pop("query")
+    if raw.get("symbol"):
+        raw["symbol"] = str(raw["symbol"]).upper()
+    if raw.get("sec_type") or not raw.get("con_id"):
+        raw["sec_type"] = str(raw.get("sec_type") or "STK").upper()
+    sec_type = raw.get("sec_type", "")
+    if raw.get("exchange") or not raw.get("con_id"):
+        raw["exchange"] = str(raw.get("exchange") or
+                              ("IDEALPRO" if sec_type == "CASH" else "SMART")).upper()
+    if raw.get("currency") or not raw.get("con_id"):
+        raw["currency"] = str(raw.get("currency") or "USD").upper()
+    if raw.get("right"):
+        right = str(raw["right"]).upper()
+        raw["right"] = {"CALL": "C", "PUT": "P"}.get(right, right)
+    if raw.get("con_id") is not None:
+        raw["con_id"] = int(raw["con_id"])
+    if raw.get("strike") is not None:
+        raw["strike"] = float(raw["strike"])
+    return raw
+
+
+def resolve_selector(values: dict, client=None, root_dir=None, refresh=False,
+                     now: int | None = None) -> dict:
+    """Resolve a stock, option, FX, index or future selector to one contract."""
+    spec = selector(**values)
+    now = int(now if now is not None else time.time())
+    cache = load(root_dir)
+    key = cache_key(spec)
+    if not refresh and cache.get(key, {}).get("con_id"):
+        return cache[key]
+    if spec.get("con_id"):
+        cached = cache.get(f"CONID:{spec['con_id']}")
+        if cached and not refresh:
+            return cached
+    if client is None:
+        from ibclient import GatewayDown
+        raise GatewayDown(f"{key} is not cached and no gateway client was given")
+    rows = client.resolve_contract(spec)
+    if not rows:
+        raise LookupError(f"IBKR returned no contract for {spec}")
+    if len(rows) > 1 and spec.get("sec_type") not in ("STK", "CASH"):
+        summary = ", ".join(str(r.get("local_symbol") or r.get("con_id")) for r in rows[:8])
+        raise LookupError(f"selector is ambiguous; IBKR offered {summary}")
+    if spec.get("sec_type") == "STK":
+        chosen, _ = pick(rows, spec["currency"], "STK")
+    else:
+        chosen = rows[0]
+    if chosen is None:
+        raise LookupError(f"IBKR returned no matching contract for {spec}")
+    contract = _to_contract(chosen, now)
+    cache[key] = contract
+    cache[cache_key(contract)] = contract
+    cache[f"CONID:{contract['con_id']}"] = contract
+    save(cache, root_dir)
+    return contract
 
 
 def resolve(symbol: str, client=None, root_dir=None, refresh: bool = False,

@@ -305,6 +305,77 @@ cold store returns zero rows instead of raising.
 
 `query` refuses anything that is not a single SELECT or WITH statement, and caps rows.
 
+## General instruments and options (v1.1)
+
+Every generalized request resolves to a full contract keyed by `con_id`. A selector may
+contain `con_id` alone, or `symbol`, `sec_type`, `exchange`, `currency`,
+`primary_exchange`, `expiry`, `strike`, `right`, `multiplier`, and `trading_class`.
+Bare conIds do not default to stocks. Resolved contracts additionally preserve
+`local_symbol`, `underlying_con_id`, and `time_zone`. The legacy upper-case ticker cache
+alias remains valid for default SMART/USD stocks; exact and non-default listings use a
+conId or full selector key so same-ticker foreign listings cannot collide.
+
+Historical datasets use this path:
+
+```
+bars-v2/{DATA_TYPE}/{session}/{interval}/{con_id}/{partition}.parquet
+```
+
+The v2 row extends `ROW` with `con_id`, `sec_type`, `data_type`, `exchange`,
+`currency`, `local_symbol`, `expiry`, `strike`, `right`, `multiplier`,
+`trading_class`, `underlying_con_id`, `time_zone`, `session_date`, and `date_anchor`.
+Dataset identity is contract + data type + session + interval + timestamp. Every newly
+qualified write uses v2. The legacy ticker layout is read compatibility only. A conId
+read never falls back to it unless the resolved contract is a stock TRADES/RTH dataset;
+symbol-only reads exclude derivatives and refuse multiple qualified stock conIds.
+
+Supported historical data types are `TRADES`, `BID`, `ASK`, `MIDPOINT`, `BID_ASK`,
+`ADJUSTED_LAST`, `HISTORICAL_VOLATILITY`, and `OPTION_IMPLIED_VOLATILITY`. Direct daily
+option bars return `option_daily_unavailable`; callers may request intraday observations
+and aggregate only with sufficient coverage. For non-stock instruments coverage returns
+`expected_bars=null`, `complete=null`, and `coverage_mode=observations` because their
+exchange grids are instrument-specific. Option TRADES uses
+`coverage_mode=sparse_trade_observations`; absent slots and dates never imply a closed
+market, and such ledger dates carry `sparse` rather than `no_data`.
+
+The coverage ledger primary key is `(con_id, data_type, interval, session, date)`.
+Opening an old jobs database migrates legacy rows to conId 0 / TRADES without discarding
+them. The historical request key includes conId, data type, interval, session, end, and
+duration.
+
+Delayed snapshots are bounded subscriptions that always cancel in a `finally` block.
+They retain partial results and IBKR warnings, identify the actual `market_data_type`,
+and give every tracked field an `available` or `unavailable` status. Non-finite values,
+max-double values, and protocol missing sentinels are null; valid negative delta and
+theta remain numbers. Implausibly large stock volume is withheld with a warning rather
+than silently rescaled.
+
+Intraday requests use `formatDate=2`, preserving their UTC instant. Generalized
+instruments preserve the requested `useRTH` dataset as `session`; `eth` is the all-hours
+request and can contain bars during ordinary US daytime. Daily values are anchored at
+midnight in the resolved exchange timezone, and rows expose `session_date` and
+`date_anchor`; an unknown timezone falls back explicitly to UTC. Continuous futures
+accept one current-window chunk because IBKR rejects explicit end times for `CONTFUT`.
+`ADJUSTED_LAST` also requires an empty end time. The service fetches one bounded chunk
+from now through the requested start, stores it, and filters the response to the exact
+requested dates; starts beyond one permitted chunk return a structured refusal. Gateway
+historical calls are bounded by the client timeout. Direct daily bars are unavailable
+for both `OPT` and `FOP`.
+
+Captured option snapshots live at
+`snapshots/{con_id}/{UTC-date}.parquet`. Each row contains receipt timestamps, full
+contract identity, bid/ask/last/close and sizes, volume/open interest, model/bid/ask/last
+Greeks, errors, warnings, field status, and actual market data type. Nested values use a
+stable JSON-on-parquet representation and are decoded by `read_snapshots`. Capture does
+not schedule future requests; `ibkr_get_option_snapshots` provides a bounded cache-only
+read surface.
+
+The public MCP additions are `ibkr_option_chain`, `ibkr_option_snapshot`,
+`ibkr_capture_option_snapshots`, `ibkr_get_option_snapshots`, and
+`ibkr_market_data_capabilities`. `ibkr_get_quote`, `ibkr_get_bars`, and
+`ibkr_resolve_contract` accept generalized selectors. No order, position, or account
+mutation method exists in the client or tool surface.
+
 ### jobs.py
 
 ```python
