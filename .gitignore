@@ -1,3 +1,6 @@
+# Skill symlinks setup.sh writes into the clone
+.claude/
+
 # Virtualenv and Python residue
 .venv/
 __pycache__/
@@ -7,6 +10,7 @@ __pycache__/
 # Credentials. Never commit these.
 .env
 services/ibkr-data/deploy/.env
+services/ibkr-data/tokens.json
 
 # Local market data store and everything generated into it
 data/

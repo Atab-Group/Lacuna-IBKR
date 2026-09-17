@@ -28,6 +28,8 @@ Every one of them is installed by `setup.sh` into a local virtualenv.
 | `store.py` | parquet partitions, DuckDB query surface | yes, filesystem only |
 | `jobs.py` | pacing bucket, coverage ledger, `ensure_bars` orchestration | yes, sqlite plus store plus client |
 | `cli.py` | argparse front end over the above | yes |
+| `tokens.py` | bearer tokens in `tokens.json`, load, check, mint | yes, one JSON file |
+| `httpserver.py` | Streamable HTTP front end over `mcpserver.dispatch` | yes, one loopback socket |
 
 Never name a module in here `ibapi.py`. That shadows IBKR's own package import and the
 failure is silent.
@@ -415,6 +417,13 @@ JSON-RPC message per line, hand-rolled the way
 `services/notification-hub/mcpserver.py` hand-rolls Streamable HTTP. It is
 registered in the repo's `.mcp.json` as `ibkr`, running under `.venv/bin/python`.
 
+`httpserver.py` is the second transport onto the same tools. `.mcp.json` names
+the stdio server by a path relative to `${CLAUDE_PROJECT_DIR}`, so a session
+started in any other folder does not find it and Claude Cowork, which never
+starts in this clone, cannot reach it at all. The HTTP front end is the answer
+to both. It is additive: the stdio path is unchanged and neither transport
+knows about the other.
+
 It reserves client ids 211 to 220. That band sits above `ibclient.CLIENT_IDS`,
 so a long CLI backfill and a tool call never collide on an id.
 
@@ -486,6 +495,89 @@ serves the cache, with the reason in `fetch_denied` and the login URL attached.
 An exhausted budget does the same, and `fetch_denied` carries the reset time. A
 missing `universe.json` returns an empty universe naming the file, and no tool
 requires a symbol to be registered.
+
+### The HTTP transport
+
+`httpserver.py`, standard library only, bound to `127.0.0.1` and nothing else.
+No TLS and no proxy in front of it, so the bearer token is the only thing
+between a caller and the data and it must never leave the loopback interface.
+
+| Route | Auth | Answers |
+|---|---|---|
+| `POST /mcp` | `Authorization: Bearer <token>` | one JSON-RPC message, or 202 with no body for a notification |
+| `GET /healthz` | none | liveness, the store root, the tool count, the live token count |
+| `GET /mcp` | bearer | 405. This server never sends anything unprompted, so there is no stream to hold open |
+| anything else | n/a | 404 |
+
+`/healthz` is the only unauthenticated route, because the watchdog has to be
+able to ask whether the server is up without holding a credential. It does not
+probe IB Gateway: that costs a 1.5 second socket timeout whenever the session is
+down, which is most of a weekend, and a down gateway is not this process being
+unhealthy because the cached bars still serve. Gateway state stays in
+`ibkr_status`, which is a tool and needs a token.
+
+No protocol code is reimplemented. A POST body goes to `mcpserver.handle_message`,
+the same function the stdio loop calls, so the two transports cannot drift. The
+`mcpserver.Session` and its `Ctx` are built once at startup and shared, exactly
+as the stdio `serve()` does, because the contract cache and the negotiated
+protocol era live on them and a per-request session would throw both away. The
+shared session is taken under a lock, since a threading server can have two
+requests in flight and `initialize` mutates the era.
+
+Codes and caps:
+
+| Condition | Status | JSON-RPC code |
+|---|---|---|
+| missing, wrong or revoked token | 401, plus `WWW-Authenticate: Bearer realm="ibkr-data"` | `-32001` |
+| unparseable body | 400 | `-32700` |
+| request body over `MAX_REQUEST_BYTES` | 413 | `-32600` |
+| envelope over `MAX_RESPONSE_BYTES + 8192` | 200 | `-32603` |
+
+The 401 body is byte-identical in shape and wording to the notification-hub
+server's, so a client that reports one clearly reports the other identically.
+The envelope cap sits 8192 bytes above the tool cap so the polite refusal from
+`call_tool`, which is itself a response, always fits through.
+
+### Tokens
+
+`tokens.py`, the same module as the notification-hub's, minus the write flag
+this read-only server has no use for. Tokens live in
+`services/ibkr-data/tokens.json`, gitignored, mode 600:
+
+```json
+{"tokens": [{"name": "nic-laptop", "token": "...",
+             "created": "2026-09-17", "revoked": false}]}
+```
+
+Each token carries a name so one client can be cut off without rotating the
+others. Revoking is setting `"revoked"` to `true`. The store stats the file on
+every check and reloads on change, so a revocation takes effect on the next
+request and never needs a restart. Comparison is `hmac.compare_digest` against
+every entry with no early exit, so the time a request takes does not leak how
+much of a token was correct. An unreadable or broken file means no valid tokens,
+which fails closed.
+
+`--add-token NAME` mints one, appends it, prints it once and exits. It is stored
+nowhere else, so a lost token is replaced rather than recovered.
+
+### Configuration
+
+| Flag | Environment | Default |
+|---|---|---|
+| `--host` | `IBKR_MCP_HOST` | `127.0.0.1` |
+| `--port` | `IBKR_MCP_PORT` | `8770` |
+| `--tokens` | `IBKR_MCP_TOKENS` | `services/ibkr-data/tokens.json` |
+| `--log` | `IBKR_MCP_LOG` | stderr |
+| `--root` | `LACUNA_IBKR_ROOT` | the repo store root |
+
+8770 because 8765 to 8767 are already taken on a Lacuna laptop. The log and
+root names are the stdio server's own, so one exported variable configures
+whichever transport is running.
+
+`deploy/ibkr-http.service` is a systemd **user** unit template, not a system
+one: the service reaches a gateway container started under the person's own
+login and a store inside their clone, and root would have a different docker
+socket and no access to either.
 
 ## The watchlist
 

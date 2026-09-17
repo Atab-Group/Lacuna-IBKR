@@ -1,8 +1,24 @@
 {
   "name": "ibkr",
-  "description": "Read-only Interactive Brokers market data for AI agents: historical bars down to 30-second resolution, event windows around a timestamp, and a local parquet store, via a stdio MCP server plus setup, login, status and market-data skills. It cannot place an order.",
-  "version": "0.3.0",
+  "description": "Read-only Interactive Brokers market data for AI agents: historical bars down to 30-second resolution, event windows around a timestamp, and a local parquet store, plus setup, login, status and market-data skills. It reaches the service over a local address, so it works from any folder and inside Cowork, not only in the folder holding the clone. It cannot place an order.",
+  "version": "0.4.0",
   "author": {
     "name": "Lacuna"
+  },
+  "userConfig": {
+    "ibkr_token": {
+      "type": "string",
+      "title": "Market data key",
+      "required": true,
+      "sensitive": true,
+      "description": "The key printed by the market data setup on this computer. It is local to your machine and grants nothing anywhere else."
+    },
+    "ibkr_url": {
+      "type": "string",
+      "title": "Market data address",
+      "required": false,
+      "description": "Leave this alone unless the setup told you otherwise. The default is the service on your own computer.",
+      "default": "http://127.0.0.1:8770/mcp"
+    }
   }
 }

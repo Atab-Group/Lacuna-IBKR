@@ -29,22 +29,8 @@ data feed.
 
 ## Installing it
 
-**a. As a Claude Code plugin**
-
-```
-/plugin marketplace add Atab-Group/Lacuna-IBKR
-/plugin install ibkr@lacuna-ibkr
-```
-
-That gives you the four skills. The service itself still needs a clone, because
-it runs a container and a virtualenv on your machine:
-
-```
-git clone https://github.com/Atab-Group/Lacuna-IBKR.git
-cd Lacuna-IBKR && ./setup.sh
-```
-
-**b. Clone and run the setup script**
+Clone it and run the setup script. There is only one path, because the plugin
+needs a key that only this machine can mint:
 
 ```
 git clone https://github.com/Atab-Group/Lacuna-IBKR.git
@@ -52,9 +38,21 @@ cd Lacuna-IBKR && ./setup.sh
 ```
 
 `setup.sh` checks for Docker and Python, builds a virtualenv, links the skills
-into `.claude/skills/`, and runs the offline test suite. It touches no network
-beyond PyPI and it does not log you in. Starting `claude` in that directory
-picks up the `ibkr` MCP server and the skills.
+into `.claude/skills/`, runs the offline test suite, then mints a key, starts
+the market data service, and prints the two lines that register the plugin with
+that key:
+
+```
+claude plugin marketplace add Atab-Group/Lacuna-IBKR
+claude plugin install ibkr@lacuna-ibkr -y --config ibkr_token=<the key it printed>
+```
+
+Run those and the market data answers in every Claude session and in Cowork,
+not only in the folder holding the clone. The key is printed once and stored
+nowhere else, so a lost one is replaced rather than recovered.
+
+It touches no network beyond PyPI and GitHub, and it does not log you in.
+Running it a second time reuses the key and leaves the running service alone.
 
 ## Handing it to an AI
 
@@ -99,6 +97,49 @@ From a shell:
 
 `services/ibkr-data/CONTRACT.md` is the full interface spec.
 `services/ibkr-data/README.md` carries the traps.
+
+## Reaching it from any folder, and from Cowork
+
+The stdio server in `.mcp.json` is found relative to the folder Claude was
+started in, so a session opened anywhere else in the filesystem gets no market
+data, and Claude Cowork, which never starts in this clone, cannot reach it at
+all. The HTTP front end fixes both: the same nine tools on a local port that a
+client reaches by URL and token.
+
+`setup.sh` does all of this for you. By hand it is:
+
+```
+.venv/bin/python services/ibkr-data/httpserver.py --add-token nic-laptop
+.venv/bin/python services/ibkr-data/httpserver.py
+```
+
+The token is printed once and stored nowhere else. It goes into the client
+config as a bearer header against `http://127.0.0.1:8770/mcp`. Revoking one is
+a two-character edit in `services/ibkr-data/tokens.json`, set `"revoked"` to
+`true`, and it takes effect on the next request with no restart.
+
+It binds `127.0.0.1` and nothing else. There is no TLS in front of it, so the
+token crosses the wire in clear text and must never leave the loopback
+interface. `GET /healthz` is the one route that needs no token, so a watchdog
+can ask whether the server is up without holding a credential.
+
+To keep it running, `setup.sh` installs and enables
+`services/ibkr-data/deploy/ibkr-http.service` as a systemd **user** unit
+wherever `systemctl --user` works, which includes WSL2 with systemd enabled in
+`/etc/wsl.conf`. Where there is no systemd it falls back to a detached
+background process, and says so, because that one does not come back after a
+restart. A user unit dies at logout unless lingering is on, and a Cowork
+session runs with nobody logged in at the desktop, so:
+
+```
+sudo loginctl enable-linger $USER
+```
+
+Check it at any time, with no key needed:
+
+```
+curl http://127.0.0.1:8770/healthz
+```
 
 ## The pacing limit
 

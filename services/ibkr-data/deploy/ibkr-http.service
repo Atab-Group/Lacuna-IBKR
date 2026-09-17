@@ -1,0 +1,57 @@
+# ibkr-data over HTTP, as a systemd USER unit.
+#
+# A user unit and not a system one, because the service reaches IB Gateway in
+# a container the person started under their own login, and the store lives in
+# their clone. Running it as root under a system unit would give it a different
+# docker socket, a different HOME and no access to either.
+#
+# Template. Replace CLONE with the absolute path of this clone, then:
+#
+#   mkdir -p ~/.config/systemd/user
+#   sed 's#CLONE#'"$PWD"'#g' services/ibkr-data/deploy/ibkr-http.service \
+#       > ~/.config/systemd/user/ibkr-http.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ibkr-http
+#   systemctl --user status ibkr-http
+#
+# Mint a token before the first start, or every request gets a 401:
+#
+#   .venv/bin/python services/ibkr-data/httpserver.py --add-token nic-laptop
+#
+# The session survives a logout only with lingering on, which matters because
+# the point of this unit is that market data is reachable from a Cowork session
+# with nobody logged in at the desktop:
+#
+#   sudo loginctl enable-linger $USER
+
+[Unit]
+Description=ibkr-data MCP: market data over HTTP on 127.0.0.1:8770
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Without this, Python block-buffers stdout when it is a file, so the log stays
+# empty for minutes and a healthy service looks stalled. That cost a live
+# debugging detour on the notification-hub deploy on 26 Aug 2026.
+Environment=PYTHONUNBUFFERED=1
+Type=simple
+WorkingDirectory=CLONE
+ExecStart=CLONE/.venv/bin/python CLONE/services/ibkr-data/httpserver.py
+Restart=always
+RestartSec=10
+StandardOutput=append:CLONE/services/ibkr-data/http.log
+StandardError=append:CLONE/services/ibkr-data/http.log
+
+# RestartSec is short because this one faces a user. A monitor that comes back
+# a minute late has missed nothing, but a query that fails is a person waiting.
+
+# The listener is loopback only and there is no TLS, so the sandboxing below is
+# the second line rather than the first: the token is what protects the data,
+# and PrivateTmp and NoNewPrivileges only limit what a compromise reaches next.
+# ProtectHome is not set, because the parquet store and tokens.json both live
+# under the user's home by design.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,3 +1,35 @@
+# 0.4.0 - 17 September 2026
+
+- The market data now works from every folder, and inside Cowork. The plugin
+  used to point at a server started from the folder Claude was opened in, so a
+  session opened anywhere else got no market data at all, and Cowork, which
+  never starts in the clone, could not reach it under any circumstances. The
+  plugin now reaches a local service by address and key instead.
+- New `httpserver.py`: the same nine tools over Streamable HTTP on
+  `127.0.0.1:8770`. It binds loopback and nothing else, and there is no TLS, so
+  the key must never leave the machine. `GET /healthz` is the one route that
+  needs no key, so a watchdog can ask whether the service is up without holding
+  a credential. The stdio server is untouched and still works.
+- New `tokens.py`: named keys in `tokens.json`, mode 600 and gitignored.
+  Revoking one is setting `"revoked"` to `true` and it takes effect on the next
+  request with no restart. Comparison is constant time over every entry.
+- `setup.sh` now finishes the job. It mints a key if there is not already a live
+  one, starts the service, installs and enables the systemd user unit where
+  systemd is available including WSL2, falls back to a detached background
+  process where it is not, says which route it took, and prints the exact two
+  lines that register the plugin with that key. Running it twice does not mint a
+  second key or start a second service.
+- The `setup` skill now runs those two lines itself rather than showing them to
+  the person, and tells them the market data works in all of their
+  conversations rather than in one folder.
+- The `status` skill now separates a stopped local service from a broken login.
+  From the outside both look like "no prices", only one of them needs the
+  person, and telling someone to log in again when nothing is listening wastes
+  a login.
+- `deploy/ibkr-http.service` is a systemd user unit template, not a system one:
+  the service reaches a gateway container started under the person's own login
+  and a store inside their clone, and root has neither.
+
 # 0.3.0 - 15 September 2026
 
 - First public release. The plugin and the service it drives now live in their

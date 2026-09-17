@@ -1,9 +1,13 @@
 {
   "mcpServers": {
     "ibkr": {
-      "type": "stdio",
-      "command": "${CLAUDE_PROJECT_DIR}/.venv/bin/python",
-      "args": ["${CLAUDE_PROJECT_DIR}/services/ibkr-data/mcpserver.py"]
+      "type": "http",
+      "url": "${user_config.ibkr_url}",
+      "title": "IBKR market data",
+      "description": "Historical bars, event windows and coverage from a local read-only Interactive Brokers store. It cannot place an order.",
+      "headers": {
+        "Authorization": "Bearer ${user_config.ibkr_token}"
+      }
     }
   }
 }
