@@ -1,0 +1,12 @@
+# One watchdog pass: real API check, then at most one automatic login or one
+# email. See watchdog.py. Template: replace CLONE as in ibkr-http.service.
+# Mail settings: ~/.config/ibkr-watchdog/smtp.env (outside the repo, 0600).
+[Unit]
+Description=IBKR session watchdog (one pass)
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=CLONE
+ExecStart=CLONE/.venv/bin/python CLONE/services/ibkr-data/watchdog.py
+TimeoutStartSec=180

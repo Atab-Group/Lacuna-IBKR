@@ -10,6 +10,7 @@ __pycache__/
 # Credentials. Never commit these.
 .env
 services/ibkr-data/deploy/.env
+services/ibkr-data/deploy/profiles/
 services/ibkr-data/tokens.json
 
 # Local market data store and everything generated into it

@@ -450,3 +450,28 @@ def test_parse_duration_reads_the_spellings():
     assert mcp.parse_duration(None, 600) == 600
     with pytest.raises(ValueError):
         mcp.parse_duration("2 fortnights")
+
+
+# ---------------------------------------------------------- login config ----
+
+def test_login_config_defaults_to_the_local_page():
+    url, sentence = mcp.login_config({})
+    assert url == "http://127.0.0.1:8642"
+    assert "human must log in at http://127.0.0.1:8642" in sentence
+
+
+def test_login_config_url_is_overridable():
+    url, sentence = mcp.login_config({"IBKR_LOGIN_URL": "https://example.test/login/"})
+    assert url == "https://example.test/login/"
+    assert "https://example.test/login/" in sentence
+    assert "127.0.0.1" not in sentence
+
+
+def test_login_config_hosted_wording():
+    url, sentence = mcp.login_config({"IBKR_HOSTED": "1",
+                                      "IBKR_LOGIN_URL": "https://example.test/login/"})
+    assert url == "https://example.test/login/"
+    assert "hosted and shared" in sentence
+    assert "Nic has already been emailed" in sentence
+    assert "page password" in sentence and "https://example.test/login/" in sentence
+    assert "Never ask for IBKR credentials" in sentence

@@ -170,7 +170,7 @@ def api_session() -> list[str] | None:
 ENV_DEFAULTS = {
     "TRADING_MODE": "live",
     "READ_ONLY_API": "yes",
-    "AUTO_RESTART_TIME": "11:59 PM",
+    "AUTO_RESTART_TIME": "07:30 AM",  # SAST: a revoked token fails while someone is awake, clear of the 05:45-06:45 NA reset
     "TIME_ZONE": "Africa/Johannesburg",
     "VNC_SERVER_PASSWORD": "lacunavnc",
 }
@@ -194,6 +194,71 @@ def write_env(values: dict[str, str]) -> None:
         lines.append(f"{key}={value}")
     ENV.write_text("\n".join(lines) + "\n")
     ENV.chmod(0o600)
+
+
+# Per-person logins for a gateway shared by several people. Each profile is
+# its own owner-only env file; deploy/.env is rewritten from the chosen one at
+# login time. The name of the profile .env was last written from sits in
+# profiles/.active.
+PROFILES = DEPLOY / "profiles"
+PROFILE_KEYS = ("TWS_USERID", "TWS_PASSWORD", "TOTP_SECRET")
+
+
+def profile_path(name: str) -> Path:
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name or ""):
+        raise ValueError(f"bad profile name: {name!r}")
+    return PROFILES / f"{name}.env"
+
+
+def profile_read(name: str) -> dict[str, str]:
+    path = profile_path(name)
+    if not path.exists():
+        return {}
+    out = {}
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            if k in PROFILE_KEYS and v.strip():
+                out[k] = v.strip()
+    return out
+
+
+def profile_has_creds(name: str) -> bool:
+    p = profile_read(name)
+    return bool(p.get("TWS_USERID") and p.get("TWS_PASSWORD"))
+
+
+def profile_write(name: str, values: dict[str, str]) -> None:
+    path = profile_path(name)
+    PROFILES.mkdir(mode=0o700, exist_ok=True)
+    PROFILES.chmod(0o700)
+    lines = [f"{k}={values[k]}" for k in PROFILE_KEYS if values.get(k)]
+    path.touch(mode=0o600)
+    path.chmod(0o600)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def profile_clear(name: str) -> None:
+    profile_path(name).unlink(missing_ok=True)
+
+
+def active_profile() -> str | None:
+    try:
+        return (PROFILES / ".active").read_text().strip() or None
+    except OSError:
+        return None
+
+
+def activate_profile(name: str) -> bool:
+    """Write deploy/.env from profile `name`. Returns True when this changes
+    the person, in which case the caller must drop the Jts volume: IBC's
+    autorestart token there belongs to whoever logged in last."""
+    p = profile_read(name)
+    write_env({k: p.get(k, "") for k in PROFILE_KEYS})
+    prev = active_profile()
+    PROFILES.mkdir(mode=0o700, exist_ok=True)
+    (PROFILES / ".active").write_text(name + "\n")
+    return prev is not None and prev != name
 
 
 def ensure_credentials(force: bool = False) -> bool:

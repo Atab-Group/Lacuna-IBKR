@@ -15,7 +15,7 @@ services:
       # few minutes, burns login attempts and gets the account throttled.
       TWOFA_TIMEOUT_ACTION: exit
       RELOGIN_AFTER_TWOFA_TIMEOUT: 'no'
-      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:59 PM}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-07:30 AM}
       TIME_ZONE: ${TIME_ZONE:-Africa/Johannesburg}
       BYPASS_WARNING: 'yes'
     volumes:
