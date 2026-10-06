@@ -1,0 +1,17 @@
+# Weekdays at 18:30 US/Eastern, whatever the host's own timezone. That is after
+# the 16:00 close in summer and in winter, so the day's bar is final, and clear
+# of the gateway's 07:30 SAST restart and IBKR's Sunday 01:00 ET token reset.
+# cli.py update leaves out any session that has not closed yet, so a manual
+# start during the day cannot settle today in the ledger before it trades.
+[Unit]
+Description=ibkr-data: weekday daily-bar update at 18:30 US/Eastern
+
+[Timer]
+OnCalendar=Mon..Fri 18:30 America/New_York
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=1m
+Unit=lacuna-ibkr-update.service
+
+[Install]
+WantedBy=timers.target

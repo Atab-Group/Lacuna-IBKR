@@ -746,22 +746,28 @@ that reports `denied`, which is what a run under a timer wants.
 ### The nightly timer
 
 systemd user units, not system units, because the gateway runs as the desktop
-user.
+user. They run on the gateway's host, so the update writes the same store
+ibkr-http serves. Templates are in `deploy/`; replace `CLONE` with the clone's path.
 
 | Unit | What |
 |---|---|
 | `~/.config/systemd/user/lacuna-ibkr-update.service` | oneshot, `cli.py update`, appends to `services/ibkr-data/update.log` |
-| `~/.config/systemd/user/lacuna-ibkr-update.timer` | `Mon..Fri 23:00 Africa/Johannesburg`, `Persistent=true` |
+| `~/.config/systemd/user/lacuna-ibkr-update.timer` | `Mon..Fri 18:30 America/New_York`, `Persistent=true` |
 
-23:00 SAST is 17:00 US/Eastern in summer and 16:00 in winter. In summer the
-session is comfortably closed. In winter the run lands on the close itself and
-may catch an unfinished daily bar; the day is picked up the following night,
-because `update` always asks for yesterday as well as today.
+18:30 US/Eastern is after the close in summer and in winter, so the day's bar is
+final. It is clear of the gateway's morning restart and of IBKR's Sunday 01:00 ET
+token reset.
 
-The hour before the gateway's own 23:59 restart is the reason for that slot, and
-`TimeoutStartSec=40m` on the service is the guard: a run that overruns is
-abandoned rather than left holding a clientId across the restart.
+`update` ends at the last closed session (`cli.last_closed_session`): before
+17:00 US/Eastern, today is left out. A request that spans an unfinished session
+would settle it in the ledger for good, as `no_data` when only earlier bars come
+back or as `ok` on a partial bar, and no later walk would ask again. So a manual
+start during the day is safe and simply stops at yesterday.
 
-`Persistent=true` means a laptop asleep at 23:00 runs the update when it wakes.
-That is safe precisely because the walk is ledger driven, so a late run asks only
-for what is genuinely missing.
+ExecStart quotes its paths. An unquoted path with a space splits there and the
+unit fails with status=203/EXEC on every run; that is how the first laptop
+install died. `tests/test_deploy_units.py` checks every template for it.
+
+`Persistent=true` means a host that was down at 18:30 runs the update when it
+comes back. That is safe precisely because the walk is ledger driven, so a late
+run asks only for what is genuinely missing.

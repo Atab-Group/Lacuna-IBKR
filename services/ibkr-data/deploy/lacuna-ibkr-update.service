@@ -1,0 +1,44 @@
+# The nightly daily-bar update for the watchlist, as a systemd USER unit, on the
+# same host and under the same user as the gateway and ibkr-http, so it writes
+# the parquet store the MCP serves. Template: replace CLONE with the absolute
+# path of this clone, then:
+#
+#   sed 's#CLONE#'"$PWD"'#g' services/ibkr-data/deploy/lacuna-ibkr-update.service \
+#       > ~/.config/systemd/user/lacuna-ibkr-update.service
+#   cp services/ibkr-data/deploy/lacuna-ibkr-update.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now lacuna-ibkr-update.timer
+#
+# The ExecStart paths are in double quotes so a clone path with a space still
+# works. systemd splits an unquoted ExecStart on the space and fails with
+# status=203/EXEC on every run, which is how the first laptop install of this
+# job died unnoticed. WorkingDirectory and StandardOutput take the whole line
+# as one path and need no quotes.
+#
+# A watchlist kept outside the clone goes in a drop-in, so the shipped
+# universe.json stays generic:
+#
+#   ~/.config/systemd/user/lacuna-ibkr-update.service.d/watchlist.conf
+#   [Service]
+#   Environment=LACUNA_IBKR_UNIVERSE=%h/.config/lacuna-ibkr/universe.json
+
+[Unit]
+Description=ibkr-data: nightly daily-bar update for the watchlist
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=CLONE
+ExecStart="CLONE/.venv/bin/python" "CLONE/services/ibkr-data/cli.py" update
+StandardOutput=append:CLONE/services/ibkr-data/update.log
+StandardError=append:CLONE/services/ibkr-data/update.log
+# A thirty-name update is at most one request per name, well inside one pacing
+# window. Forty minutes is the ceiling for a run that slept through a spent
+# budget, and it ends long before the gateway's morning restart.
+TimeoutStartSec=40m
+Nice=10
+
+[Install]
+WantedBy=default.target
