@@ -1,0 +1,17 @@
+# The login page (webui.py) on 127.0.0.1:8642, as a systemd USER unit, so the
+# hosted re-login page and the watchdog always have it to talk to. Template:
+# replace CLONE as in ibkr-http.service. It only logs in when someone presses
+# its button (or the watchdog does, with TOTP_SECRET set); starting it is inert.
+[Unit]
+Description=IBKR gateway login page on 127.0.0.1:8642
+
+[Service]
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=CLONE
+ExecStart=CLONE/.venv/bin/python CLONE/services/ibkr-data/webui.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

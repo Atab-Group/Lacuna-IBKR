@@ -3,9 +3,11 @@
 
     .venv/bin/python services/ibkr-data/webui.py    # then open the URL it prints
 
-Binds to 127.0.0.1 only. The page asks for the IBKR username and password
-(saved to deploy/.env, owner-only, gitignored), starts the gateway, and asks
-for the six digit authenticator code at the moment the gateway wants it.
+Binds to 127.0.0.1 only. The page asks who is logging in, and the first time
+each person picks their name, their own IBKR username and password (saved to
+deploy/profiles/<name>.env, owner-only, gitignored). It writes deploy/.env
+from that profile, starts the gateway, and asks for the six digit code from
+that person's authenticator at the moment the gateway wants it.
 Stdlib only on the server side; the terminal flow in gateway.py stays the
 authority for the underlying mechanics, which this imports.
 """
@@ -29,6 +31,11 @@ ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
 # page served by a rebound DNS name or a cross-site form cannot drive this
 # server even from the same machine.
 CSRF_TOKEN = secrets.token_urlsafe(32)
+
+# One per person who may do the weekly re-login, each with their own IBKR
+# username and phone authenticator.
+PROFILES = {"nic": "Nic", "ben": "Ben"}
+BUSY = {"starting", "waiting", "need_code", "typing", "opening"}
 
 STEPS = ["credentials", "starting the container", "waiting for the gateway",
          "authenticator code", "sending the code", "opening the API"]
@@ -58,9 +65,10 @@ def set_state(**kw) -> None:
 def get_state() -> dict:
     with _lock:
         out = dict(_state)
-    out["creds_present"] = bool(gw.env_value("TWS_USERID")
-                                and gw.env_value("TWS_PASSWORD"))
-    out["totp_present"] = bool(gw.env_value("TOTP_SECRET"))
+    out["profiles"] = [{"id": k, "label": v, "creds": gw.profile_has_creds(k)}
+                       for k, v in PROFILES.items()]
+    active = gw.active_profile()
+    out["active_profile"] = active if active in PROFILES else None
     out["now"] = time.time()
     return out
 
@@ -72,10 +80,15 @@ def step_done(name: str, nxt: str | None) -> None:
         _state["active"] = nxt
 
 
-def login_worker() -> None:
+def login_worker(switched: bool = False) -> None:
     try:
         step_done("credentials", "starting the container")
         set_state(phase="starting", message="")
+        if switched:
+            # Another person's autorestart token lives in the Jts volume.
+            # Down with -v drops the container and that volume, so the new
+            # person gets a cold login of their own and never the old token.
+            gw.compose("down", "-v")
 
         age = gw.throttle_age()
         if age is not None and age < gw.THROTTLE_COOLDOWN:
@@ -136,6 +149,11 @@ def login_worker() -> None:
                     # A mistyped secret must degrade to the normal prompt,
                     # never kill the login.
                     gw.write_env({"TOTP_SECRET": ""})
+                    who = gw.active_profile()
+                    if who in PROFILES:
+                        p = gw.profile_read(who)
+                        p.pop("TOTP_SECRET", None)
+                        gw.profile_write(who, p)
                     set_state(message="The stored TOTP secret was not valid "
                                       "and has been removed. Type the code "
                                       "from your authenticator app instead.")
@@ -196,18 +214,23 @@ def login_worker() -> None:
                     _state["message"] += " Gateway cleanup failed; stop the container manually."
 
 
-def start_login() -> str | None:
+def start_login(profile: str | None = None) -> str | None:
     global _worker
-    if not (gw.env_value("TWS_USERID") and gw.env_value("TWS_PASSWORD")):
+    profile = profile or gw.active_profile()
+    if profile not in PROFILES:
+        return "pick who is logging in"
+    if not gw.profile_has_creds(profile):
         set_state(phase="needs_creds", done=[], active="credentials",
                   accounts=[], message="")
         return "credentials first"
     if _worker and _worker.is_alive():
         return "already running"
+    switched = gw.activate_profile(profile)
     set_state(phase="starting", done=["credentials"],
               active="starting the container", accounts=[], message="",
               deadline=None)
-    _worker = threading.Thread(target=login_worker, daemon=True)
+    _worker = threading.Thread(target=login_worker, args=(switched,),
+                               daemon=True)
     _worker.start()
     return None
 
@@ -216,6 +239,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IBKR gateway</title><style>
 :root{color-scheme:dark}
+button{min-height:44px}
 body{margin:0;background:#0d1117;color:#e6edf3;
   font:15px/1.5 system-ui,-apple-system,sans-serif;
   display:flex;justify-content:center;padding:40px 16px}
@@ -258,12 +282,13 @@ button.quiet{background:#21262d;color:#c9d1d9}
 </div><script>
 const el=q=>document.getElementById(q);
 const TOKEN='__CSRF__';
-let S=null,lastSig='',cerr='';
+let S=null,lastSig='',cerr='',P=null,confirmSwitch=false;
+const BUSY=['starting','waiting','need_code','typing','opening'];
 async function post(u,b){const r=await fetch(u,{method:'POST',
   headers:{'Content-Type':'application/json','X-CSRF-Token':TOKEN},
   body:JSON.stringify(b||{})});
   let j={};try{j=await r.json();}catch(e){}
-  cerr=r.ok?'':(j.error||'request failed');
+  cerr=(r.ok&&j.ok!==false)?'':(j.error||'request failed');
   lastSig='';tick();}
 function steps(){
   const names=["credentials","starting the container","waiting for the gateway",
@@ -277,47 +302,55 @@ function steps(){
     }
     return `<div class="step ${cls}"><div class="dot"></div><span>${n}${extra}</span></div>`;
   }).join('')+'</div>';}
+function who(id){const p=(S.profiles||[]).find(x=>x.id===id);return p?p.label:id;}
+function pick(id){P=id;confirmSwitch=false;cerr='';render();}
 function render(){
   // A re-render rebuilds the inputs, so carry typed values across it.
   const keep={};['u','p','t','c'].forEach(k=>{const n=el(k);if(n)keep[k]=n.value;});
+  const busy=BUSY.includes(S.phase),A=S.active_profile;
   let h='';
   if(cerr)h+=`<div class="msg err">${cerr}</div>`;
+  if(S.phase==='logged_in')h+=`<div class="msg ok">Logged in as <b>${who(A)}</b>
+    (account ${S.accounts.join(', ')}).</div>`;
+  else if(busy&&A)h+=`<div class="sub">Logging in as <b>${who(A)}</b></div>`;
   if(S.message)h+=`<div class="msg ${S.phase==='failed'?'err':'info'}">${S.message}</div>`;
-  if(S.phase==='logged_in'){
-    h+=`<div class="msg ok">Logged in. Account <b>${S.accounts.join(', ')}</b> is
-      serving on <span class="mono">127.0.0.1:4001</span>.</div>`+steps()+
-      `<div class="hint">Pull something:<br><span class="mono">
-      .venv/bin/python services/ibkr-data/check_connection.py AAPL MSFT</span></div>`;
-  }else if(S.phase==='idle'||S.phase==='needs_creds'||
-           (S.phase==='failed'&&!S.creds_present)){
-    if(!S.creds_present){
-      h+=`<div class="panel"><b>IBKR credentials</b>
-      <div class="hint">Saved to deploy/.env on this machine only, owner-readable,
-      ignored by git. The password is your IBKR website login.</div>
+  if(busy){
+    if(S.phase==='need_code'){
+      const left=Math.max(0,Math.floor(S.deadline-S.now));
+      h+=steps()+`<div class="panel"><b>authenticator code</b>
+      <div class="hint">${who(A)}: open your authenticator app and type a fresh 6 digit code.</div>
+      <input id="c" class="code" maxlength="6" inputmode="numeric" autocomplete="one-time-code" autofocus
+        oninput="if(this.value.length===6)post('code',{c:this.value})">
+      <div class="count">window closes in ${Math.floor(left/60)}m ${left%60}s</div></div>`;
+    }else h+=steps();
+  }else if(!P){
+    h+=`<div class="panel"><b>Who is logging in?</b>`+(S.profiles||[]).map(p=>
+      `<button class="${p.id===A&&S.phase==='logged_in'?'quiet':''}"
+        onclick="pick('${p.id}')">${p.label}</button>`).join('')+`</div>`;
+  }else{
+    const me=(S.profiles||[]).find(x=>x.id===P)||{};
+    h+=`<div class="sub">Logging in as <b>${who(P)}</b></div>`;
+    if(S.phase==='logged_in'&&A===P){
+      h+=`<div class="hint">You are already logged in. Nothing to do.</div>`;
+    }else if(S.phase==='logged_in'&&A&&A!==P&&!confirmSwitch){
+      h+=`<button onclick="confirmSwitch=true;render()">This will sign out ${who(A)} and use your login</button>`;
+    }else if(!me.creds){
+      h+=`<div class="panel"><b>${who(P)}'s IBKR login</b>
+      <div class="hint">Your own IBKR username and password, asked once and saved on
+      the gateway machine only, owner-readable. The password is your IBKR website login.</div>
       <label>username</label><input id="u" autocomplete="username">
-      <label>password</label><input id="p" type="password">
+      <label>password</label><input id="p" type="password" autocomplete="current-password">
       <label>TOTP secret <span style="color:#586069">(optional, usually left
       empty. NOT the 6 digit code: the page asks for that later, once the
-      gateway is up. This is the long base32 key behind the authenticator QR,
-      for people who never want to be asked for codes.)</span></label>
+      gateway is up.)</span></label>
       <input id="t" type="password" placeholder="leave empty">
-      <button onclick="post('/creds',{u:el('u').value,p:el('p').value,
+      <button onclick="post('creds',{profile:P,u:el('u').value,p:el('p').value,
         t:el('t').value})">save and log in</button></div>`;
     }else{
-      h+=steps()+`<button onclick="post('/start')">start login</button>
-      <button class="quiet" onclick="post('/creds_clear')">change credentials</button>`;
+      h+=steps()+`<button onclick="post('start',{profile:P})">${S.phase==='failed'?'Log in again':'Log in'}</button>
+      <button class="quiet" onclick="post('creds_clear',{profile:P})">change ${who(P)}'s saved login</button>`;
     }
-  }else if(S.phase==='need_code'){
-    const left=Math.max(0,Math.floor(S.deadline-S.now));
-    h+=steps()+`<div class="panel"><b>authenticator code</b>
-    <div class="hint">Open the authenticator app and type a fresh 6 digit code.</div>
-    <input id="c" class="code" maxlength="6" inputmode="numeric" autofocus
-      oninput="if(this.value.length===6)post('/code',{c:this.value})">
-    <div class="count">window closes in ${Math.floor(left/60)}m ${left%60}s</div></div>`;
-  }else if(S.phase==='failed'){
-    h+=steps()+`<button onclick="post('/start')">start again</button>`;
-  }else{
-    h+=steps();
+    h+=`<button class="quiet" onclick="pick(null)">back</button>`;
   }
   el('app').innerHTML=h;
   Object.entries(keep).forEach(([k,v])=>{const n=el(k);if(n&&v)n.value=v;});
@@ -331,12 +364,12 @@ function countdown(){
   if(a&&S&&S.phase_ts){
     a.textContent=`· ${Math.max(0,Math.floor(S.now-S.phase_ts))}s`;}}
 async function tick(){
-  try{S=await (await fetch('/state')).json();}catch(e){return;}
+  try{S=await (await fetch('state')).json();}catch(e){return;}
   // Re-render only when the state really changed. innerHTML replacement
   // destroys the inputs, so rendering on every poll wipes whatever the
   // user is halfway through typing.
   const sig=JSON.stringify([S.phase,S.done,S.active,S.message,S.accounts,
-    S.creds_present,S.totp_present]);
+    S.profiles,S.active_profile]);
   if(sig!==lastSig){lastSig=sig;render();}
   countdown();}
 setInterval(tick,1500);tick();
@@ -392,6 +425,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "bad token"}, 403)
             return
         data = self._body()
+        profile = data.get("profile") or ""
+        if self.path in ("/creds", "/creds_clear") and profile not in PROFILES:
+            self._json({"error": "pick who is logging in"}, 400)
+            return
         if self.path == "/creds":
             user = (data.get("u") or "").strip()
             password = (data.get("p") or "").strip()
@@ -416,16 +453,15 @@ class Handler(BaseHTTPRequestHandler):
                                 "after the gateway is up."}, 400)
                     return
                 values["TOTP_SECRET"] = secret
-            gw.write_env(values)
-            start_login()
-            self._json({"ok": True})
+            gw.profile_write(profile, values)
+            err = start_login(profile)
+            self._json({"ok": err is None, "error": err})
         elif self.path == "/creds_clear":
-            gw.write_env({"TWS_USERID": "", "TWS_PASSWORD": ""})
-            set_state(phase="needs_creds", done=[], active="credentials",
-                      message="", accounts=[])
+            gw.profile_clear(profile)
+            set_state(done=[], active=None, message="")
             self._json({"ok": True})
         elif self.path == "/start":
-            err = start_login()
+            err = start_login(profile or None)
             self._json({"ok": err is None, "error": err})
         elif self.path == "/code":
             code = (data.get("c") or "").strip()
@@ -451,8 +487,8 @@ def session_watchdog() -> None:
             set_state(phase="idle", done=["credentials"], active=None,
                       accounts=[],
                       message="The gateway session has ended (nightly restart "
-                              "or the weekly Sunday reset). Press start login "
-                              "to bring it back.")
+                              "or the weekly Sunday reset). Pick your name "
+                              "and log in to bring it back.")
 
 
 def main() -> int:
@@ -462,10 +498,8 @@ def main() -> int:
     accounts = gw.api_session()
     if accounts:
         set_state(phase="logged_in", done=list(STEPS), accounts=accounts)
-    elif gw.env_value("TWS_USERID") and gw.env_value("TWS_PASSWORD"):
-        set_state(phase="idle", done=["credentials"], active=None)
     else:
-        set_state(phase="needs_creds", active="credentials")
+        set_state(phase="idle", active=None)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

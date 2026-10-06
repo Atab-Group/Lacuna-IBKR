@@ -194,6 +194,36 @@ second factor living beside the password, and on a secondary username the
 account owner has to agree. Re-enrolling the authenticator to capture the secret may
 also invalidate the owner's existing enrolment on their own phone.
 
+## Hosted gateway and the weekly re-login
+
+When the gateway runs on an always-on box (ours is goober3) three user units
+keep the weekly Sunday reset to a phone tap. Install each from `deploy/` with
+the same `CLONE` substitution as `ibkr-http.service`.
+
+- `ibkr-webui.service` keeps the login page up on 127.0.0.1:8642. Starting it
+  logs nothing in; only its button does.
+- `ibkr-watchdog.timer` runs `watchdog.py` every 5 minutes. "Logged in" means
+  a real API handshake (`gateway.api_session`), never the page's state. With
+  `TOTP_SECRET` in `deploy/.env` it presses the page's button itself, at most
+  once per 6 hours and 3 times per 7 days (persisted in
+  `~/.local/state/ibkr-watchdog/state.json`), and a failed attempt ends
+  automation until the session is back. Otherwise, or after that failure, it
+  emails once per outage, reminds every 12 hours at most, and emails once on
+  recovery. SMTP settings, recipient and `LOGIN_URL` live outside the repo in
+  `~/.config/ibkr-watchdog/smtp.env` (0600).
+- The reverse tunnel forwards a second port, 8773 to the page, and the public
+  nginx serves it under `/ibkr/login/` behind basic auth, rewriting `Host` to
+  `127.0.0.1:8642` so the page's rebinding guard and CSRF token still hold.
+  The page's URLs are relative for this reason; keep them so.
+- Several people can do the re-login, each with their own IBKR username and
+  phone authenticator. The page asks "Who is logging in?"; each profile
+  (`nic`, `ben`, listed in `webui.PROFILES`) keeps its login in
+  `deploy/profiles/<name>.env` (0600, gitignored, created the first time that
+  person types it), and `deploy/.env` is rewritten from the chosen profile
+  at login. The watchdog's automatic path uses any profile with a
+  `TOTP_SECRET`, and `ALERT_TO` takes a comma-separated list so everyone who
+  can log in gets the email. nginx has one basic-auth user per person.
+
 ## Traps
 
 - Host port 4001 maps to container port 4003, because the image puts socat in
@@ -229,6 +259,10 @@ also invalidate the owner's existing enrolment on their own phone.
   login attempts" after about nine tries, then locks the account. The compose
   file deliberately carries `restart: "no"` and `TWOFA_TIMEOUT_ACTION: exit`
   for the same reason: a missed code stops the container and waits.
+- The Jts volume's autorestart token belongs to whoever logged in last.
+  Switching to another profile therefore runs `docker compose down -v`,
+  dropping the container and that volume, so the new person does a cold login
+  and never rides the other one's token. The same profile never clears it.
 - `vncdo` opens a new VNC connection per invocation, several seconds each, so
   chain every action into one call. A loop of single keystrokes takes longer
   than the 30 second TOTP window and the code expires mid-typing.

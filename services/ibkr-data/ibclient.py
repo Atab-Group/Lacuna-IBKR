@@ -11,6 +11,7 @@ and the failure is silent.
 from __future__ import annotations
 
 import math
+import os
 import time
 
 HOST = "127.0.0.1"
@@ -18,7 +19,7 @@ PORT = 4001            # live gateway; the image maps host 4001 to container 400
 CLIENT_IDS = tuple(range(201, 211))   # this service's reserved band
 DELAYED = 3            # reqMarketDataType: 1 live, 2 frozen, 3 delayed, 4 delayed-frozen
 
-LOGIN_URL = "http://127.0.0.1:8642"
+LOGIN_URL = os.environ.get("IBKR_LOGIN_URL") or "http://127.0.0.1:8642"
 
 
 class GatewayDown(RuntimeError):

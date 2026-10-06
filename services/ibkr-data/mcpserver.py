@@ -72,12 +72,35 @@ MAX_RESPONSE_BYTES = 400_000
 SQL_ROW_CAP = 500          # the plan's cap for ibkr_query_sql
 DEFAULT_MAX_BARS = 2000    # bars in one response before the tail is trimmed
 
-LOGIN_URL = "http://127.0.0.1:8642"
-LOGIN_SENTENCE = (
-    "A human must log in at " + LOGIN_URL + ". Two factor authentication means "
-    "no tool can do this for you, and a programmatic retry gets the account "
-    "throttled and then locked."
-)
+DEFAULT_LOGIN_URL = "http://127.0.0.1:8642"
+
+
+def login_config(env=None):
+    """(login URL, the sentence that tells the caller who logs in).
+
+    IBKR_LOGIN_URL overrides the URL. IBKR_HOSTED=1 is the shared, hosted
+    gateway: Nic is emailed when it signs out, and only someone holding a page
+    password logs in themselves.
+    """
+    env = os.environ if env is None else env
+    url = env.get("IBKR_LOGIN_URL") or DEFAULT_LOGIN_URL
+    if env.get("IBKR_HOSTED") == "1":
+        return url, (
+            "Market data is hosted and shared. When the session is signed out, "
+            "Nic has already been emailed and will log in again. Only someone "
+            "with a login page password may do it themselves, at " + url + ". "
+            "Never ask for IBKR credentials or two factor codes in chat, and "
+            "never retry a login programmatically: IBKR throttles and then "
+            "locks the account. Cached bars still serve meanwhile."
+        )
+    return url, (
+        "A human must log in at " + url + ". Two factor authentication means "
+        "no tool can do this for you, and a programmatic retry gets the account "
+        "throttled and then locked."
+    )
+
+
+LOGIN_URL, LOGIN_SENTENCE = login_config()
 
 # This service's own client id band. ibclient reserves 201-210 for the CLI and
 # the backfill; the MCP server takes the next ten so a long CLI job and a tool
