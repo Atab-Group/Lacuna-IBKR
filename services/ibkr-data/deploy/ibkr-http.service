@@ -36,7 +36,7 @@ Wants=network-online.target
 Environment=PYTHONUNBUFFERED=1
 Type=simple
 WorkingDirectory=CLONE
-ExecStart=CLONE/.venv/bin/python CLONE/services/ibkr-data/httpserver.py
+ExecStart="CLONE/.venv/bin/python" "CLONE/services/ibkr-data/httpserver.py"
 Restart=always
 RestartSec=10
 StandardOutput=append:CLONE/services/ibkr-data/http.log

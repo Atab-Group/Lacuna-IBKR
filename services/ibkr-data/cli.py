@@ -308,6 +308,23 @@ def _yesterday_ny() -> dt.date:
     return barlib.market_time(time.time()).date() - dt.timedelta(days=1)
 
 
+# A daily bar is final some time after the 16:00 close. Before this hour,
+# US/Eastern, today is still trading or has not opened, and a request that spans
+# it settles it for good: `no_data` when only earlier bars come back, or `ok` on
+# a partial bar. Neither is ever asked for again.
+SESSION_FINAL_HOUR = 17
+
+
+def last_closed_session(now_et: dt.datetime) -> dt.date:
+    """The newest US/Eastern date whose daily bar is final. Pure.
+
+    Weekends need no special case: the walk keeps weekdays only.
+    """
+    if now_et.hour < SESSION_FINAL_HOUR:
+        return now_et.date() - dt.timedelta(days=1)
+    return now_et.date()
+
+
 # --------------------------------------------------------------------------
 # watchlist commands
 # --------------------------------------------------------------------------
@@ -459,8 +476,8 @@ def cmd_backfill(args) -> int:
 
 
 def cmd_update(args) -> int:
-    """Yesterday and today for every name. What the nightly timer runs."""
-    end = barlib.market_time(time.time()).date()
+    """The last closed session or two for every name. What the nightly timer runs."""
+    end = last_closed_session(barlib.market_time(time.time()))
     start = end - dt.timedelta(days=args.days)
     start_ts = barlib.day_start_epoch(start)
     end_ts = barlib.day_start_epoch(end + dt.timedelta(days=1))
@@ -577,7 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     upd = sub.add_parser("update", help="the last session or two, for the nightly timer")
     upd.add_argument("--days", type=int, default=1,
-                     help="calendar days back from today, US/Eastern")
+                     help="calendar days back from the last closed session, US/Eastern")
     upd.add_argument("--interval", default="1d")
     upd.add_argument("--file", default=None)
     upd.add_argument("--symbols", nargs="*", default=None)

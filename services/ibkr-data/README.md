@@ -112,9 +112,16 @@ Killing it costs nothing. Both walkers decide what to ask for from the coverage
 ledger, so a restart picks up at the first session date that never settled and a
 finished run costs zero requests.
 
-`update` is what a nightly timer should call. On Linux a systemd user timer
-does the job:
+`update` is what a nightly timer should call. It asks for the last closed
+session or two and leaves out a session still trading. On Linux the templates in
+`deploy/` install a systemd user timer on the host that runs the gateway, so the
+update writes the store ibkr-http serves:
 
+    sed 's#CLONE#'"$PWD"'#g' services/ibkr-data/deploy/lacuna-ibkr-update.service \
+        > ~/.config/systemd/user/lacuna-ibkr-update.service
+    cp services/ibkr-data/deploy/lacuna-ibkr-update.timer ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    systemctl --user enable --now lacuna-ibkr-update.timer
     systemctl --user list-timers lacuna-ibkr-update.timer
     systemctl --user start lacuna-ibkr-update.service   # run it now
     tail services/ibkr-data/update.log

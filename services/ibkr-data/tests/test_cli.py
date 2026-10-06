@@ -8,6 +8,7 @@ the whole pacing budget on data already held.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 
 import cli
@@ -118,3 +119,13 @@ def test_write_universe_keeps_the_file_shape(tmp_path):
     assert written["symbols"][0]["con_id"] == 29110391
     assert written["symbols"][0]["primary_exchange"] == "NYSE"
     assert written["symbols"][0]["case"] == "big-tech"
+
+
+def test_update_leaves_out_a_session_that_has_not_closed():
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    # before the open and during the session, today is not final yet
+    assert cli.last_closed_session(dt.datetime(2026, 10, 6, 5, 40, tzinfo=et)) == dt.date(2026, 10, 5)
+    assert cli.last_closed_session(dt.datetime(2026, 10, 6, 16, 5, tzinfo=et)) == dt.date(2026, 10, 5)
+    # the nightly slot, 18:30 US/Eastern, takes today
+    assert cli.last_closed_session(dt.datetime(2026, 10, 6, 18, 30, tzinfo=et)) == dt.date(2026, 10, 6)
