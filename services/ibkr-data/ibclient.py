@@ -293,7 +293,9 @@ class Client:
                             entry[1] = ib.reqMktData(entry[2], generic_ticks, snapshot=False,
                                                      regulatorySnapshot=False)
                             entry[3] = True
-                        ib.reqMarketDataType(LIVE)
+                        # Stay delayed: the gateway applies the type when it
+                        # handles the request, so switching back to live here
+                        # turns the fallback into another refused live request.
                 if all(priced(t) for _, t, _, _ in tickers):
                     # Greeks often follow the first price update.
                     if all(i.get("sec_type") != "OPT" or self._greeks(t.modelGreeks)

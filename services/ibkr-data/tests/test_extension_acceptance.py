@@ -595,6 +595,7 @@ def test_snapshot_falls_back_to_delayed_only_for_the_refused_contract(monkeypatc
     assert bayn["bid"] == 44.99 and bayn["status"] == "complete"
     assert spy["market_data_type"] == 1 and spy["live_refused"] is False
     assert fake.requests == [(68598660, 1), (756733, 1), (68598660, 3)]
+    assert fake.kinds[-1] == 3      # never flips back to live after a fallback
     assert fake.handlers == []
 
 
