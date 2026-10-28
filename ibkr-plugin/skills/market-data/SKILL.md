@@ -1,6 +1,6 @@
 ---
 name: market-data
-description: Use for read-only IBKR market-data work across equities, options, indexes, futures and FX, including contract resolution, option chains, delayed quotes and Greeks, historical bars, captured option snapshots, event studies, coverage and gateway state.
+description: Use for read-only IBKR market-data work across equities, options, indexes, futures and FX, including contract resolution, option chains, live or delayed quotes and Greeks, historical bars, captured option snapshots, event studies, coverage and gateway state.
 ---
 
 # IBKR market data
@@ -17,8 +17,8 @@ trading actions through this skill.
 | List the configured equity watchlist | `ibkr_list_symbols` |
 | Resolve a stock or a precise instrument | `ibkr_resolve_contract` |
 | Discover expirations, strikes and option contracts | `ibkr_option_chain` |
-| Read a delayed quote for one instrument | `ibkr_get_quote` |
-| Read delayed quotes, Greeks and open interest for options | `ibkr_option_snapshot` |
+| Read a quote for one instrument | `ibkr_get_quote` |
+| Read quotes, Greeks and open interest for options | `ibkr_option_snapshot` |
 | Save current option snapshots for later research | `ibkr_capture_option_snapshots` |
 | Read option snapshots already saved locally | `ibkr_get_option_snapshots` |
 | Explain implemented series and optionally probe gateway connectivity | `ibkr_market_data_capabilities` |
@@ -42,8 +42,10 @@ also impose caps so one request cannot subscribe to an entire large chain.
 ## Interpret snapshots carefully
 
 Quote and option snapshot responses report the actual market-data type and a
-collection time. On accounts without live subscriptions this is commonly
-delayed data. The collection time is when this service received the values; it
+collection time. The service asks for live data first and falls back to delayed
+per contract when the logged-in IBKR username lacks the live subscription:
+`market_data_type` 1 is live, 3 is delayed, and `live_refused: true` marks a
+contract that fell back. Say which one a price is when you quote it. The collection time is when this service received the values; it
 is not an exchange trade timestamp and does not measure the exact delay.
 
 Snapshot fields can arrive at different times. Read `field_status`, the overall

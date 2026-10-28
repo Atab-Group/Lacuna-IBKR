@@ -1,6 +1,6 @@
 {
   "name": "ibkr",
-  "description": "Read-only Interactive Brokers market data for AI agents: equities, options, delayed quotes and Greeks, historical bars, option snapshot capture, event windows, and a local parquet store. It cannot place an order.",
+  "description": "Read-only Interactive Brokers market data for AI agents: equities, options, live or delayed quotes and Greeks, historical bars, option snapshot capture, event windows, and a local parquet store. It cannot place an order.",
   "version": "0.5.0",
   "author": {
     "name": "Lacuna"

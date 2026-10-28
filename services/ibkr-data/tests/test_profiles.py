@@ -92,3 +92,7 @@ def test_auto_login_picks_any_profile_with_totp_active_first(deploy):
                              "TOTP_SECRET": "JBSWY3DP"})
     gw.activate_profile("nic")
     assert watchdog.totp_profile(gw) == "nic"
+
+
+def test_lacuna_profile_is_offered_on_the_login_page():
+    assert webui.PROFILES["lacuna"] == "Lacuna"

@@ -206,6 +206,12 @@ def ibkr_port() -> int:
     return ibclient.PORT
 
 
+def live_quotes() -> bool:
+    import ibclient
+
+    return ibclient.QUOTES != "delayed"
+
+
 def probe_socket(timeout: float = 1.5) -> tuple[bool, str]:
     """Is anything listening on the gateway's API port?
 
@@ -954,7 +960,7 @@ def tool_query_sql(args, ctx=None) -> dict:
 
 
 def tool_get_quote(args, ctx=None) -> dict:
-    """A bounded delayed quote, preserving partial fields and warnings."""
+    """A bounded quote, live where subscribed else delayed, preserving partial fields and warnings."""
     ctx = ctx or DEFAULT_CTX
     if not (args.get("symbol") or args.get("query") or args.get("con_id")):
         return bad_argument("symbol, query or con_id is required",
@@ -972,7 +978,7 @@ def tool_get_quote(args, ctx=None) -> dict:
         rows = client.market_snapshot([contract], timeout=timeout)
         return {"contract": contract, "quote": rows[0] if rows else None,
                 "status": rows[0]["status"] if rows else "unavailable",
-                "source": "ibkr", "delayed_requested": True}
+                "source": "ibkr", "live_requested": live_quotes()}
     except (LookupError, ValueError) as exc:
         return bad_argument(str(exc), "Pass an exact contract selector or con_id.")
     except Exception as exc:
@@ -1076,7 +1082,7 @@ def tool_option_snapshot(args, ctx=None, capture=False) -> dict:
         rows = client.market_snapshot(contracts, timeout=timeout)
         written = store.write_snapshots(rows, ctx.root_dir) if capture and rows else {}
         return {"snapshots": rows, "n_snapshots": len(rows), "source": "ibkr",
-                "delayed_requested": True, "written": written}
+                "live_requested": live_quotes(), "written": written}
     except (LookupError, ValueError) as exc:
         return bad_argument(str(exc), "Pass exact option contracts or a bounded chain selector.")
     except Exception as exc:
@@ -1359,8 +1365,10 @@ TOOLS = [
         "name": "ibkr_get_quote",
         "title": "Get a quote",
         "description": (
-            "A bounded delayed quote for an exact stock, option, index, FX or futures "
-            "contract. Partial fields and IBKR entitlement warnings are preserved."),
+            "A bounded quote for an exact stock, option, index, FX or futures "
+            "contract. Live where the logged-in username has the subscription, otherwise "
+            "delayed; market_data_type says which (1 live, 3 delayed). Partial fields and "
+            "IBKR entitlement warnings are preserved."),
         "inputSchema": {
             "type": "object",
             "properties": {**_SELECTOR_PROPERTIES,
@@ -1381,8 +1389,8 @@ TOOLS = [
             "exchange": {"type": "string"}}, "required": ["underlying"]},
     },
     {
-        "name": "ibkr_option_snapshot", "title": "Get delayed option snapshots",
-        "description": "Collect delayed quotes, sizes, model and quote Greeks, volume and open interest for at most 100 exact options.",
+        "name": "ibkr_option_snapshot", "title": "Get option snapshots",
+        "description": "Collect quotes (live where the logged-in username is subscribed, otherwise delayed), sizes, model and quote Greeks, volume and open interest for at most 100 exact options.",
         "inputSchema": {"type": "object", "properties": {
             "contracts": {"type": "array", "items": {"type": "object"}},
             "underlying": {"type": "string"}, "expiry": {"type": "string"},
@@ -1392,7 +1400,7 @@ TOOLS = [
     },
     {
         "name": "ibkr_capture_option_snapshots", "title": "Capture option snapshots",
-        "description": "Collect the same bounded delayed option snapshot and retain it in parquet for future historical research.",
+        "description": "Collect the same bounded option snapshot and retain it in parquet for future historical research.",
         "inputSchema": {"type": "object", "properties": {
             "contracts": {"type": "array", "items": {"type": "object"}},
             "underlying": {"type": "string"}, "expiry": {"type": "string"},
@@ -1402,7 +1410,7 @@ TOOLS = [
     },
     {
         "name": "ibkr_get_option_snapshots", "title": "Read captured option snapshots",
-        "description": "Read retained delayed quote, Greek and open-interest snapshots for one option conId without touching IBKR.",
+        "description": "Read retained quote, Greek and open-interest snapshots for one option conId without touching IBKR.",
         "inputSchema": {"type": "object", "properties": {
             "con_id": {"type": "integer"}, "start": {"type": "string"},
             "end": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 5000}},
@@ -1419,7 +1427,8 @@ TOOL_NAMES = [t["name"] for t in TOOLS]
 
 INSTRUCTIONS = (
     "Read-only market data from Interactive Brokers for stocks, options, indexes, "
-    "FX, futures and futures options: delayed quotes and option Greeks, option-chain "
+    "FX, futures and futures options: quotes and option Greeks (live where the "
+    "logged-in username is subscribed, otherwise delayed), option-chain "
     "discovery, retained snapshots, and historical bars cached in parquet and served "
     "with a coverage block that states what was asked for against what actually "
     "exists. Reach for it for contract discovery, semi-live observations, historical "
@@ -1434,7 +1443,7 @@ INSTRUCTIONS = (
     "programmatically.\n\n"
     "Start at ibkr_status or ibkr_market_data_capabilities, use "
     "ibkr_resolve_contract for an exact identity, ibkr_option_chain for bounded "
-    "option discovery, ibkr_get_quote or ibkr_option_snapshot for delayed data, and "
+    "option discovery, ibkr_get_quote or ibkr_option_snapshot for quotes, and "
     "ibkr_event_window or ibkr_get_bars for historical windows."
 )
 
