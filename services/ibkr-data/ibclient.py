@@ -18,6 +18,13 @@ HOST = "127.0.0.1"
 PORT = 4001            # live gateway; the image maps host 4001 to container 4003
 CLIENT_IDS = tuple(range(201, 211))   # this service's reserved band
 DELAYED = 3            # reqMarketDataType: 1 live, 2 frozen, 3 delayed, 4 delayed-frozen
+LIVE = 1
+# Quotes ask for live data first and fall back to delayed per contract when
+# IBKR refuses live for that username. IBKR_QUOTES=delayed skips the live try.
+QUOTES = (os.environ.get("IBKR_QUOTES") or "live").strip().lower()
+# Not subscribed (354), no API subscription (10089, 10090), no live for this
+# instrument (10168), and a competing live session on the same username (10197).
+LIVE_REFUSED = {354, 10089, 10090, 10168, 10197}
 
 LOGIN_URL = os.environ.get("IBKR_LOGIN_URL") or "http://127.0.0.1:8642"
 
@@ -241,36 +248,66 @@ class Client:
 
     def market_snapshot(self, contracts: list[dict], timeout: float = 8.0,
                         generic_ticks: str = "100,101,104,106") -> list[dict]:
-        """Bounded delayed subscriptions. Partial values survive API warnings."""
+        """Bounded subscriptions, live first with a per-contract delayed fallback.
+
+        Partial values survive API warnings. Each row's market_data_type says
+        what IBKR actually sent (1 live, 3 delayed), and live_refused says
+        whether live was asked for and declined for that contract.
+        """
         ib = self._require()
         timeout = min(max(float(timeout), 0.25), 20.0)
-        tickers = []
+        live = QUOTES != "delayed"
+        tickers = []    # [item, ticker, qualified contract, fell back to delayed]
         errors = []
         def on_error(req_id, code, message, contract=None, *extra):
-            errors.append({"request_id": req_id, "code": code, "message": str(message)})
+            errors.append({"request_id": req_id, "code": code, "message": str(message),
+                           "con_id": getattr(contract, "conId", None)})
         ib.errorEvent += on_error
         started = time.time()
+
+        def priced(t):
+            return (t.marketDataType in (1, 2, 3, 4) and
+                    any(self._number(getattr(t, f, None), allow_negative=False) is not None
+                        for f in ("bid", "ask", "last", "close")))
+
         try:
+            ib.reqMarketDataType(LIVE if live else DELAYED)
             for item in contracts:
-                tickers.append((item, ib.reqMktData(self.qualify(item), generic_ticks,
-                                                    snapshot=False, regulatorySnapshot=False)))
+                contract = self.qualify(item)
+                tickers.append([item, ib.reqMktData(contract, generic_ticks, snapshot=False,
+                                                    regulatorySnapshot=False), contract, False])
             while time.time() - started < timeout:
                 ib.sleep(0.2)
-                if all((t.marketDataType in (1, 2, 3, 4) and
-                        any(self._number(getattr(t, f, None), allow_negative=False) is not None
-                            for f in ("bid", "ask", "last", "close")))
-                       for _, t in tickers):
+                if live:
+                    refused = {e["con_id"] for e in errors if e["code"] in LIVE_REFUSED}
+                    retry = [entry for entry in tickers if not entry[3]
+                             and getattr(entry[2], "conId", None) in refused
+                             and not priced(entry[1])]
+                    if retry:
+                        ib.reqMarketDataType(DELAYED)
+                        for entry in retry:
+                            try:
+                                ib.cancelMktData(entry[2])
+                            except Exception:
+                                pass
+                            entry[1] = ib.reqMktData(entry[2], generic_ticks, snapshot=False,
+                                                     regulatorySnapshot=False)
+                            entry[3] = True
+                        ib.reqMarketDataType(LIVE)
+                if all(priced(t) for _, t, _, _ in tickers):
                     # Greeks often follow the first price update.
                     if all(i.get("sec_type") != "OPT" or self._greeks(t.modelGreeks)
-                           for i, t in tickers):
+                           for i, t, _, _ in tickers):
                         break
             receipt = int(time.time())
             out = []
-            for item, t in tickers:
+            for item, t, _contract, fell_back in tickers:
                 row = dict(item)
                 row.update({
                     "ts": receipt, "collected_ts": receipt,
                     "market_data_type": int(t.marketDataType or 0) or None,
+                    "live_requested": live,
+                    "live_refused": fell_back,
                     "bid": self._number(t.bid, allow_negative=False),
                     "ask": self._number(t.ask, allow_negative=False),
                     "last": self._number(t.last, allow_negative=False),
@@ -299,11 +336,13 @@ class Client:
                            "model_greeks", "bid_greeks", "ask_greeks", "last_greeks")
                 row["field_status"] = {name: ("available" if row.get(name) is not None else "unavailable")
                                        for name in tracked}
-                row["status"] = "complete" if populated and not errors else ("partial" if populated else "unavailable")
+                # A live refusal that the delayed fallback answered is not a fault.
+                faults = [e for e in errors if not (fell_back and e["code"] in LIVE_REFUSED)]
+                row["status"] = "complete" if populated and not faults else ("partial" if populated else "unavailable")
                 out.append(row)
             return out
         finally:
-            for _item, ticker in tickers:
+            for _item, ticker, _contract, _fell_back in tickers:
                 try:
                     ib.cancelMktData(ticker.contract)
                 except Exception:

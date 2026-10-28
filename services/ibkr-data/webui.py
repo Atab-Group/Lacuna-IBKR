@@ -34,7 +34,7 @@ CSRF_TOKEN = secrets.token_urlsafe(32)
 
 # One per person who may do the weekly re-login, each with their own IBKR
 # username and phone authenticator.
-PROFILES = {"nic": "Nic", "ben": "Ben"}
+PROFILES = {"nic": "Nic", "ben": "Ben", "lacuna": "Lacuna"}
 BUSY = {"starting", "waiting", "need_code", "typing", "opening"}
 
 STEPS = ["credentials", "starting the container", "waiting for the gateway",

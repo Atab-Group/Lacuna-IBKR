@@ -490,6 +490,9 @@ def test_delayed_snapshot_reports_actual_mode_withholds_bad_volume_and_cancels(m
             self.errorEvent = Event()
             self.cancelled = []
 
+        def reqMarketDataType(self, kind):
+            return None
+
         def reqMktData(self, contract, *args, **kwargs):
             return ticker
 
@@ -514,6 +517,95 @@ def test_delayed_snapshot_reports_actual_mode_withholds_bad_volume_and_cancels(m
     assert any("volume" in warning for warning in row["warnings"])
     assert len(fake_ib.cancelled) == 1
     assert fake_ib.errorEvent.handlers == []
+
+
+class _QuoteIB:
+    """Answers each reqMktData in the mode last set, refusing live for `refuse`."""
+
+    def __init__(self, refuse=()):
+        self.refuse = set(refuse)
+        self.handlers = []
+        self.errorEvent = self
+        self.kind = None
+        self.kinds = []
+        self.requests = []
+        self.cancelled = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        self.handlers.remove(handler)
+        return self
+
+    def reqMarketDataType(self, kind):
+        self.kind = kind
+        self.kinds.append(kind)
+
+    def reqMktData(self, contract, *args, **kwargs):
+        self.requests.append((contract.conId, self.kind))
+        if self.kind == 1 and contract.conId in self.refuse:
+            for handler in list(self.handlers):
+                handler(7, 10089, "Requested market data requires additional subscription for API.", contract)
+            return SimpleNamespace(contract=contract, marketDataType=1, bid=None, ask=None,
+                                   last=None, close=None, bidSize=None, askSize=None,
+                                   lastSize=None, volume=None, modelGreeks=None, bidGreeks=None,
+                                   askGreeks=None, lastGreeks=None)
+        return SimpleNamespace(contract=contract, marketDataType=self.kind, bid=44.99, ask=45.0,
+                               last=45.01, close=44.5, bidSize=10, askSize=12, lastSize=1,
+                               volume=1000, modelGreeks=None, bidGreeks=None,
+                               askGreeks=None, lastGreeks=None)
+
+    def sleep(self, seconds):
+        return None
+
+    def cancelMktData(self, contract):
+        self.cancelled.append(contract.conId)
+
+
+def _quote_client(monkeypatch, fake):
+    client = ibclient.Client()
+    client.ib = fake
+    monkeypatch.setattr(client, "qualify", lambda item: SimpleNamespace(conId=item["con_id"]))
+    return client
+
+
+_BAYN = {"symbol": "BAYN", "con_id": 68598660, "sec_type": "STK", "exchange": "IBIS", "currency": "EUR"}
+_SPY = {"symbol": "SPY", "con_id": 756733, "sec_type": "STK", "exchange": "SMART", "currency": "USD"}
+
+
+def test_snapshot_returns_live_when_the_username_is_subscribed(monkeypatch):
+    monkeypatch.setattr(ibclient, "QUOTES", "live")
+    fake = _QuoteIB()
+    row = _quote_client(monkeypatch, fake).market_snapshot([_BAYN], timeout=1)[0]
+
+    assert row["market_data_type"] == 1
+    assert row["live_requested"] is True and row["live_refused"] is False
+    assert row["status"] == "complete"
+    assert fake.requests == [(68598660, 1)]
+
+
+def test_snapshot_falls_back_to_delayed_only_for_the_refused_contract(monkeypatch):
+    monkeypatch.setattr(ibclient, "QUOTES", "live")
+    fake = _QuoteIB(refuse={68598660})
+    bayn, spy = _quote_client(monkeypatch, fake).market_snapshot([_BAYN, _SPY], timeout=1)
+
+    assert bayn["market_data_type"] == 3 and bayn["live_refused"] is True
+    assert bayn["bid"] == 44.99 and bayn["status"] == "complete"
+    assert spy["market_data_type"] == 1 and spy["live_refused"] is False
+    assert fake.requests == [(68598660, 1), (756733, 1), (68598660, 3)]
+    assert fake.handlers == []
+
+
+def test_delayed_setting_never_asks_for_live(monkeypatch):
+    monkeypatch.setattr(ibclient, "QUOTES", "delayed")
+    fake = _QuoteIB()
+    row = _quote_client(monkeypatch, fake).market_snapshot([_BAYN], timeout=1)[0]
+
+    assert row["market_data_type"] == 3
+    assert row["live_requested"] is False and row["live_refused"] is False
+    assert 1 not in fake.kinds
 
 
 def test_read_only_surface_has_no_order_or_account_mutation_methods():
