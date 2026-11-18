@@ -22,7 +22,8 @@ travelling in clear text must never leave the loopback interface.
 
 Usage:
     .venv/bin/python services/ibkr-data/httpserver.py
-    .venv/bin/python services/ibkr-data/httpserver.py --add-token nic-laptop
+    .venv/bin/python services/ibkr-data/httpserver.py --add-token example-laptop
+    .venv/bin/python services/ibkr-data/httpserver.py --add-token example-desk --write
 """
 
 from __future__ import annotations
@@ -162,11 +163,11 @@ class Handler(BaseHTTPRequestHandler):
     # ---- auth
 
     def authorise(self):
-        """Return the token name, or None after sending a 401."""
+        """Return the token's ``{"name", "write"}``, or None after sending a 401."""
         presented = tokens.bearer_from_header(self.headers.get("Authorization"))
-        name = self.cfg.tokens.check(presented) if presented else None
-        if name:
-            return name
+        found = self.cfg.tokens.identify(presented) if presented else None
+        if found:
+            return found
         reason = "no bearer token" if not presented else "bad or revoked token"
         agent = self.headers.get("User-Agent", "-")
         log(f"401 {reason} ip={self.client_address[0]} method={self.command} "
@@ -234,10 +235,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path_only() != "/mcp":
                 return self.send_obj(404, mcpserver.rpc_error(
                     None, mcpserver.E_METHOD_NOT_FOUND, f"no route {self.path_only()}"))
-            name = self.authorise()
-            if name is None:
+            token = self.authorise()
+            if token is None:
                 return
-            return self.handle_rpc(name, raw)
+            return self.handle_rpc(token, raw)
         except Exception:
             self.fail_safely()
 
@@ -252,7 +253,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- the MCP endpoint
 
-    def handle_rpc(self, token_name, raw):
+    def handle_rpc(self, token, raw):
+        """``token`` is what ``authorise`` returned. Its write flag goes with
+        the message, so a tool that changes something can refuse a read token."""
         try:
             message = json.loads(raw.decode("utf-8")) if raw else None
         except (UnicodeDecodeError, ValueError) as exc:
@@ -264,7 +267,8 @@ class Handler(BaseHTTPRequestHandler):
                 None, mcpserver.E_INVALID_REQUEST, "body must be a JSON-RPC object"))
 
         with self.cfg.session_lock:
-            response = mcpserver.handle_message(self.cfg.session, message)
+            response = mcpserver.handle_message(self.cfg.session, message,
+                                                can_write=token["write"])
 
         if response is None:
             # A notification carries no id and gets no body, per the transport
@@ -274,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
         method = message.get("method") if isinstance(message, dict) else "batch"
         params = message.get("params") if isinstance(message, dict) else None
         tool = (params or {}).get("name") if method == "tools/call" else None
-        log(f"ok token={token_name} method={method}" + (f" tool={tool}" if tool else ""))
+        log(f"ok token={token['name']} method={method}" + (f" tool={tool}" if tool else ""))
         return self.send_obj(200, response)
 
     def healthz(self):
@@ -298,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
             "version": SERVER_VERSION,
             "transport": "streamable-http",
             "store_root": root,
-            "tools": len(mcpserver.TOOL_NAMES),
+            "tools": len(mcpserver.listed_tools()),
             "live_tokens": sum(1 for t in self.cfg.tokens.tokens() if not t["revoked"]),
         })
 
@@ -354,12 +358,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="ibkr-data MCP server (Streamable HTTP)")
     parser.add_argument("--add-token", metavar="NAME",
                         help="generate a token, append it to tokens.json, print it once, and exit")
+    parser.add_argument("--write", action="store_true",
+                        help="with --add-token: the token may call tools that change "
+                             "something (ibkr_update_price_alert)")
     parser.add_argument("--tokens", help="path to tokens.json")
     parser.add_argument("--port", type=int, help=f"port to bind on {DEFAULT_HOST} (default {DEFAULT_PORT})")
     parser.add_argument("--host", help=f"address to bind (default {DEFAULT_HOST})")
     parser.add_argument("--log", help="append log lines here instead of stderr")
     parser.add_argument("--root", help="store root, overriding LACUNA_IBKR_ROOT")
     args = parser.parse_args(argv)
+    if args.write and not args.add_token:
+        parser.error("--write only makes sense with --add-token NAME")
 
     _LOG_PATH = args.log or _LOG_PATH
 
@@ -368,10 +377,11 @@ def main(argv=None):
 
     if args.add_token:
         try:
-            token = tokens.add_token(cfg.tokens.path, args.add_token)
+            token = tokens.add_token(cfg.tokens.path, args.add_token, write=args.write)
         except ValueError as exc:
             sys.exit(f"FATAL: {exc}")
-        print(f"token for {args.add_token!r}, shown once and not stored anywhere else:\n")
+        access = "read and write" if args.write else "read only"
+        print(f"token for {args.add_token!r} ({access}), shown once and not stored anywhere else:\n")
         print(token)
         print(f"\nwritten to {cfg.tokens.path} (mode 600)")
         return 0
