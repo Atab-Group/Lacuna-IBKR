@@ -1,6 +1,6 @@
 ---
 name: market-data
-description: Use for read-only IBKR market-data work across equities, options, indexes, futures and FX, including contract resolution, option chains, live or delayed quotes and Greeks, historical bars, captured option snapshots, event studies, coverage and gateway state.
+description: Use for read-only IBKR market-data work across equities, options, indexes, futures and FX, including contract resolution, option chains, live or delayed quotes and Greeks, historical bars, captured option snapshots, event studies, coverage and gateway state, and, where installed, the live price tape and price-alert thresholds.
 ---
 
 # IBKR market data
@@ -129,6 +129,34 @@ If a call fails on session state, use `ibkr_status`. Give the returned login URL
 to the human and stop. Never submit credentials, type a two-factor code or retry
 a failed login programmatically. A running local socket alone does not prove the
 upstream market-data farms are healthy; a small data request is the useful check.
+
+## Live tape and price alerts
+
+Some installations also list five price-alert tools. They exist only where a
+price-alert engine runs beside this service; if `ibkr_list_price_alerts` is not
+in your tool list, none of this applies.
+
+| Need | Tool |
+|---|---|
+| What a watched instrument did in the last few minutes | `ibkr_get_live_tape` |
+| Which instruments are watched, their thresholds, health and last alert | `ibkr_list_price_alerts` |
+| Alerts that fired, with the figures at firing | `ibkr_list_price_alert_history` |
+| What proposed thresholds would have fired on a past day | `ibkr_test_price_alert` |
+| Change a threshold or switch a watch on or off | `ibkr_update_price_alert` |
+
+For the last few minutes of a watched instrument, use `ibkr_get_live_tape` in
+place of `ibkr_get_bars`: historical bars can run about 15 minutes late, while
+the tape is recorded live. The tape exists only for watched instruments, so
+call `ibkr_list_price_alerts` first for the watch ids. Read `age_seconds` and
+`live` before quoting a price; `heartbeat_age_seconds` tells a stopped engine
+from a quiet market, and `live: false` in hours means the watch is blind.
+
+Before changing a threshold, replay a recent day with `ibkr_test_price_alert`
+and its `overrides`, show the person what would have fired, and read the
+change back to them. Only then call `ibkr_update_price_alert`. A refusal with
+`write_not_allowed` means this connection is read only: tell the person to ask
+the operator for a write token, and stop. Recipients appear as counts only;
+never try to work out who receives the alerts.
 
 ## References
 
