@@ -203,14 +203,24 @@ the same `CLONE` substitution as `ibkr-http.service`.
 - `ibkr-webui.service` keeps the login page up on 127.0.0.1:8642. Starting it
   logs nothing in; only its button does.
 - `ibkr-watchdog.timer` runs `watchdog.py` every 5 minutes. "Logged in" means
-  a real API handshake (`gateway.api_session`), never the page's state. With
+  a real API handshake (`gateway.api_session`) AND a tiny data probe (two daily
+  EUR.USD bars) that returns rows. The page's own state never counts. The probe
+  was added on 20 Nov 2026: on 18 Nov the gateway sat on "Existing session
+  detected" for hours while the handshake still answered. Nothing is sent until
+  an outage has lasted 9 minutes (20 if only the probe fails), so the 07:30
+  SAST restart blip stays quiet. With
   `TOTP_SECRET` in `deploy/.env` it presses the page's button itself, at most
   once per 6 hours and 3 times per 7 days (persisted in
   `~/.local/state/ibkr-watchdog/state.json`), and a failed attempt ends
   automation until the session is back. Otherwise, or after that failure, it
   emails once per outage, reminds every 12 hours at most, and emails once on
   recovery. SMTP settings, recipient and `LOGIN_URL` live outside the repo in
-  `~/.config/ibkr-watchdog/smtp.env` (0600).
+  `~/.config/ibkr-watchdog/smtp.env` (0600). The same outage goes to WhatsApp
+  as exactly two messages, "signed out" and "back", with no reminders, each
+  retried every pass until the gateway accepts it. Route, token (wa-gateway
+  consumer `ibkr-watchdog`) and recipients live in
+  `~/.config/ibkr-watchdog/whatsapp.env` (`WHATSAPP_URLS`, `WHATSAPP_TOKEN`,
+  `WHATSAPP_TO`). No file means no WhatsApp.
 - The reverse tunnel forwards a second port, 8773 to the page, and the public
   nginx serves it under `/ibkr/login/` behind basic auth, rewriting `Host` to
   `127.0.0.1:8642` so the page's rebinding guard and CSRF token still hold.
