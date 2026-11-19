@@ -116,7 +116,7 @@ client reaches by URL and token.
 `setup.sh` does all of this for you. By hand it is:
 
 ```
-.venv/bin/python services/ibkr-data/httpserver.py --add-token nic-laptop
+.venv/bin/python services/ibkr-data/httpserver.py --add-token example-laptop
 .venv/bin/python services/ibkr-data/httpserver.py
 ```
 
@@ -147,6 +147,45 @@ Check it at any time, with no key needed:
 ```
 curl http://127.0.0.1:8770/healthz
 ```
+
+## Optional: live price-alert tools
+
+If a separate price-alert engine runs on the same machine, five more tools can
+sit beside the market-data tools: `ibkr_get_live_tape` (the last minutes of a
+watched instrument, recorded live), `ibkr_list_price_alerts`,
+`ibkr_list_price_alert_history`, `ibkr_test_price_alert` (replay a past day
+through proposed thresholds) and `ibkr_update_price_alert` (change a
+threshold). The engine is not part of this repository. Without it nothing
+changes: the tools stay hidden.
+
+Point the server at the engine's files to switch them on:
+
+```
+LACUNA_PRICE_ALERTS_DIR=/path/to/engine/state        # holds tape.db and heartbeat.json
+LACUNA_PRICE_ALERTS_RULES=/path/to/price-alerts.json  # the engine's rules file
+LACUNA_PRICE_ALERTS_BACKTEST=/path/to/backtest.py     # optional
+LACUNA_PRICE_ALERTS_PYTHON=/path/to/python            # optional, default this server's
+LACUNA_PRICE_ALERTS_VALIDATOR=/path/to/config.py      # optional, the engine's own rules check
+```
+
+Before a change is written, the merged rules file is checked whole against the
+engine's field and cross-field rules, so the tool never writes a file the engine
+would ignore. With `LACUNA_PRICE_ALERTS_VALIDATOR` set, the engine's own
+`config.py --check` also runs on the new file before it replaces the old one,
+and a refusal there leaves the old file in place.
+
+Reading needs any token. Changing a threshold needs a token minted with write
+access:
+
+```
+.venv/bin/python services/ibkr-data/httpserver.py --add-token example-desk --write
+```
+
+The flag is the `"write": true` field on that token's entry in `tokens.json`;
+absent means read only. Over stdio there is no token, so the stdio server may
+change rules only when `LACUNA_PRICE_ALERTS_STDIO_WRITE=1` is set. No tool ever
+returns who the alerts go to. `services/ibkr-data/CONTRACT.md` has the
+arguments, the bounds a change must respect and the error codes.
 
 ## Storage and pacing
 

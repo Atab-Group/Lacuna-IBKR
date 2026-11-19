@@ -1,3 +1,30 @@
+# 0.6.0 - 19 November 2026
+
+- Five optional price-alert tools, listed only when `LACUNA_PRICE_ALERTS_DIR`
+  names the state directory of a price-alert engine on the same machine:
+  `ibkr_get_live_tape`, `ibkr_list_price_alerts`,
+  `ibkr_list_price_alert_history`, `ibkr_test_price_alert` and
+  `ibkr_update_price_alert`. Without that variable the tool list is unchanged.
+- The live tape gives the last minutes of a watched instrument as they were
+  recorded, for the moments when historical bars are still about 15 minutes
+  behind. Every reply says how old its newest row is and whether the feed is
+  live.
+- `ibkr_test_price_alert` replays a stored day through proposed thresholds, and
+  `ibkr_update_price_alert` changes them within fixed bounds. Contracts, hours,
+  the cooldown and recipients cannot be changed through a tool.
+- Tokens gain an optional `"write": true`. Only a write token may change a
+  threshold; `--add-token NAME --write` mints one. Over stdio, writing needs
+  `LACUNA_PRICE_ALERTS_STDIO_WRITE=1`.
+- `ibkr_update_price_alert` checks the whole merged rules file against the
+  engine's field and cross-field rules before it writes, and, when
+  `LACUNA_PRICE_ALERTS_VALIDATOR` names the engine's `config.py`, runs that
+  check on the new file before the rename. A dotted key in `changes` or
+  `overrides` is turned into a nested one. A symlinked rules file stays a link.
+- No tool returns who the alerts go to: the listing gives counts, and every
+  reply, error replies included, is scrubbed of recipient values.
+- The market-data skill says when to use the tape in place of bars, and to
+  test and read back a change before making it.
+
 # 0.5.0 - 18 September 2026
 
 - Added generalized contract resolution by `conId` or full instrument fields,

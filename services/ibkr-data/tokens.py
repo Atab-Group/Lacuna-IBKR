@@ -3,11 +3,16 @@
 
 Tokens live in tokens.json beside the server:
 
-    {"tokens": [{"name": "nic-laptop", "token": "...",
-                 "created": "2026-08-26", "revoked": false}]}
+    {"tokens": [{"name": "example-laptop", "token": "...",
+                 "created": "2026-08-26", "revoked": false, "write": false}]}
 
 Each token carries a name so one client can be cut off without rotating the
-others. Revoking is a two-character edit: set "revoked" to true. The store
+others.
+
+``write`` is optional and false when absent. Only a token whose entry holds
+the JSON value ``true`` may call a tool that changes something, which today is
+``ibkr_update_price_alert`` alone. Any other value, including the string
+"true", reads as false, so a typo never grants write access. Revoking is a two-character edit: set "revoked" to true. The store
 stats the file on every check and reloads when it changes, so a revocation
 takes effect on the next request and never needs a restart.
 
@@ -15,7 +20,8 @@ Comparison is hmac.compare_digest against every entry, with no early exit, so
 the time a request takes does not leak how much of a token was correct.
 
 This module reads tokens.json and, under --add-token only, appends to it. The
-MCP server itself never calls the writing path.
+MCP server itself never calls the writing path. ``--add-token NAME --write``
+mints a token with write access.
 """
 
 import hmac
@@ -69,6 +75,7 @@ def load_tokens(path):
             "token": token,
             "created": str(entry.get("created") or ""),
             "revoked": bool(entry.get("revoked", False)),
+            "write": entry.get("write") is True,
         })
     return out
 
@@ -103,12 +110,13 @@ class TokenStore:
         self.reload_if_changed()
         return list(self._tokens)
 
-    def check(self, presented):
-        """Return the name of the matching live token, or None.
+    def identify(self, presented):
+        """Return ``{"name", "write"}`` for the matching live token, or None.
 
         Every entry is compared even after a match is found. An early return
         would make a request against a long token list finish measurably
-        sooner once the right prefix was guessed.
+        sooner once the right prefix was guessed. The token value itself is
+        never part of the answer.
         """
         self.reload_if_changed()
         if not presented:
@@ -118,12 +126,19 @@ class TokenStore:
         for entry in self._tokens:
             same = hmac.compare_digest(entry["token"].encode("utf-8"), want)
             if same and not entry["revoked"] and matched is None:
-                matched = entry["name"]
+                matched = {"name": entry["name"], "write": entry["write"]}
         return matched
 
+    def check(self, presented):
+        """Return the name of the matching live token, or None."""
+        found = self.identify(presented)
+        return found["name"] if found else None
 
-def add_token(path, name, today=None):
+
+def add_token(path, name, today=None, write=False):
     """Generate a token, append it to tokens.json, and lock the file down.
+
+    ``write=True`` lets the token call tools that change something.
 
     Returns the raw token. It is printed once by the CLI and never stored
     anywhere else, so a lost token is replaced rather than recovered.
@@ -155,6 +170,7 @@ def add_token(path, name, today=None):
         "token": token,
         "created": (today or date.today()).isoformat(),
         "revoked": False,
+        "write": bool(write),
     })
     data["tokens"] = entries
 

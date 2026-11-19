@@ -178,7 +178,7 @@ def test_request_worker_has_an_asyncio_loop_for_ib_async(live, monkeypatch):
     base, token, _, _ = live
     seen_open = []
 
-    def fake_handle_message(session, message):
+    def fake_handle_message(session, message, can_write=None):
         loop = asyncio.get_event_loop()
         seen_open.append(not loop.is_closed())
         return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"ok": True}}
@@ -281,3 +281,92 @@ def test_the_token_file_is_not_world_readable(tmp_path):
     path = str(tmp_path / "tokens.json")
     tokenlib.add_token(path, "laptop")
     assert oct(os.stat(path).st_mode & 0o777) == "0o600"
+
+
+# ---------------------------------------------- write flag and price alerts ----
+
+import pricealert_fixture as pafix  # noqa: E402
+
+
+def test_a_token_is_read_only_unless_minted_with_write(tmp_path):
+    path = str(tmp_path / "tokens.json")
+    read = tokenlib.add_token(path, "reader")
+    write = tokenlib.add_token(path, "writer", write=True)
+    store = tokenlib.TokenStore(path)
+    assert store.identify(read) == {"name": "reader", "write": False}
+    assert store.identify(write) == {"name": "writer", "write": True}
+    assert store.check(write) == "writer"
+    assert store.identify("wrong") is None
+    entries = json.loads(open(path).read())["tokens"]
+    assert [e["write"] for e in entries] == [False, True]
+
+
+@pytest.mark.parametrize("value,expected", [(True, True), ("true", False), (1, False),
+                                            (None, False)])
+def test_only_the_json_value_true_grants_write(tmp_path, value, expected):
+    path = tmp_path / "tokens.json"
+    entry = {"name": "t", "token": "secret-token-value", "revoked": False}
+    if value is not None:
+        entry["write"] = value
+    path.write_text(json.dumps({"tokens": [entry]}))
+    assert tokenlib.TokenStore(str(path)).identify("secret-token-value")["write"] is expected
+
+
+def test_add_token_cli_mints_a_write_token(tmp_path, capsys):
+    path = str(tmp_path / "tokens.json")
+    assert httpserver.main(["--tokens", path, "--add-token", "writer", "--write"]) == 0
+    assert "(read and write)" in capsys.readouterr().out
+    assert json.loads(open(path).read())["tokens"][0]["write"] is True
+
+
+def test_write_flag_alone_is_refused(tmp_path):
+    with pytest.raises(SystemExit):
+        httpserver.main(["--tokens", str(tmp_path / "tokens.json"), "--write"])
+
+
+@pytest.fixture()
+def alerts_live(tmp_path, monkeypatch, live):
+    engine = tmp_path / "engine"
+    engine.mkdir()
+    cfg = pafix.build(engine)
+    for name, value in pafix.env_for(cfg).items():
+        monkeypatch.setenv(name, value)
+    return cfg, live
+
+
+def update_call(changes):
+    return {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "ibkr_update_price_alert",
+                       "arguments": {"watch": "example-watch", "changes": changes}}}
+
+
+def test_over_http_a_read_token_lists_the_tools_and_is_refused_on_update(alerts_live):
+    cfg, (base, token, _, _) = alerts_live
+    status, body = post(base, LIST, token)
+    names = [t["name"] for t in body["result"]["tools"]]
+    assert len(names) == 19
+    assert names[-5:] == ["ibkr_get_live_tape", "ibkr_list_price_alerts",
+                          "ibkr_list_price_alert_history", "ibkr_test_price_alert",
+                          "ibkr_update_price_alert"]
+
+    text = cfg.rules_path.read_text()
+    status, body = post(base, update_call({"enabled": False}), token)
+    assert status == 200
+    assert body["result"]["isError"] is True
+    assert body["result"]["structuredContent"]["error"]["code"] == "write_not_allowed"
+    assert cfg.rules_path.read_text() == text
+
+
+def test_over_http_a_write_token_changes_a_threshold(alerts_live):
+    cfg, (base, _, tokens_path, _) = alerts_live
+    writer = tokenlib.add_token(tokens_path, "writer", write=True)
+    status, body = post(base, update_call({"tiers": {"early": {"move_pct": 1.0}}}), writer)
+    assert status == 200
+    result = body["result"]["structuredContent"]
+    assert result["changed"] == ["tiers.early.move_pct"]
+    assert json.loads(cfg.rules_path.read_text())["watches"][0]["tiers"]["early"]["move_pct"] == 1.0
+
+
+def test_healthz_counts_the_price_alert_tools_when_on(alerts_live):
+    _, (base, _, _, _) = alerts_live
+    assert get(base, "/healthz")[1]["tools"] == 19

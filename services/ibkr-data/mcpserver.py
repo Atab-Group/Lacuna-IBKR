@@ -44,10 +44,11 @@ sys.path.insert(0, str(HERE))
 import bars as barlib            # noqa: E402
 import contracts as contractlib  # noqa: E402
 import jobs                      # noqa: E402
+import pricealerts               # noqa: E402
 import store                     # noqa: E402
 
 SERVER_NAME = "ibkr-data"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 
 # Protocol revisions this server speaks, modern first. Same list as the
 # notification-hub server, for the same reason: clients in the wild lag.
@@ -143,16 +144,19 @@ class Ctx:
 
     ``root_dir`` points a test at a temporary store. ``now`` freezes the clock.
     ``connect`` is the gateway factory, so a test substitutes one that raises
-    instead of opening a socket.
+    instead of opening a socket. ``runner`` runs the price-alert backtest
+    subprocess, so a test substitutes one that never starts a process.
     """
 
-    def __init__(self, root_dir=None, now=None, connect=None, probe=None):
+    def __init__(self, root_dir=None, now=None, connect=None, probe=None, runner=None):
         self.root_dir = root_dir
         self._now = now
         # Resolved lazily so the two gateway functions can be defined below,
         # next to the rest of the gateway code.
         self._connect = connect
         self._probe = probe
+        # The price-alert backtest subprocess, so a test substitutes a fake.
+        self.runner = runner
 
     def now(self) -> float:
         return float(self._now) if self._now is not None else time.time()
@@ -1425,6 +1429,156 @@ TOOLS = [
 
 TOOL_NAMES = [t["name"] for t in TOOLS]
 
+
+# --------------------------------------------------------------------------
+# optional price-alert tools
+# --------------------------------------------------------------------------
+#
+# Listed and callable only when LACUNA_PRICE_ALERTS_DIR names the state
+# directory of a price-alert engine on this machine. Unset, the tool list above
+# is the whole server and these names are unknown tools. The logic is all in
+# pricealerts.py; this file only declares them and hands calls over.
+
+_READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True,
+              "openWorldHint": False}
+_WATCH_ARG = {"type": "string", "pattern": "^[a-z0-9-]+$",
+              "description": "A watch id from ibkr_list_price_alerts, such as example-watch."}
+_CHANGES_DESC = (
+    "A partial watch holding only fields that may change: tiers.early and tiers.firm "
+    "(move_pct 0.05 to 20, volume_x 1 to 100, require a non-empty list of price, volume, "
+    "market), volume.min_trades (0 to 1000), volume.min_dollars (0 to 100000000), "
+    "price.max_spread_pct (0.05 to 10), gap.move_pct (0.05 to 20), gap.step_pct and "
+    "gap.rearm_pct (0.1 to 10), and enabled. The early tier may not exceed the firm tier. "
+    "Example: {\"tiers\": {\"early\": {\"move_pct\": 1.0}}}.")
+
+PRICE_ALERT_TOOLS = [
+    {
+        "name": pricealerts.TOOL_LIVE_TAPE,
+        "title": "Live price tape",
+        "description": (
+            "The last N one-minute rows (default 30, at most 390) recorded live by the "
+            "price-alert engine for one watched instrument: last, bid, ask, mid, spread, "
+            "volume, trades, dollar volume and data type, each with the engine's move "
+            "reading for that minute (move_pct, volume_x, market_pct, verdict). Use this in "
+            "place of ibkr_get_bars when you need the last few minutes: the bars can run "
+            "about 15 minutes late, the tape is live. It exists only for watched instruments "
+            "(see ibkr_list_price_alerts). age_seconds says how old the newest row is, live "
+            "says whether the feed is live right now, and heartbeat_age_seconds tells a dead "
+            "engine from a quiet market. truncated is true when older rows exist past the "
+            "window. It never touches the gateway."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "watch": _WATCH_ARG,
+                "minutes": {"type": "integer", "minimum": 1,
+                            "maximum": pricealerts.TAPE_MAX_MINUTES,
+                            "description": "Minutes back from the newest row. Default 30."},
+            },
+            "required": ["watch"],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": pricealerts.TOOL_LIST,
+        "title": "List price alerts",
+        "description": (
+            "Every price-alert watch: its instrument, trading hours, thresholds per tier "
+            "(move_pct, volume_x, require), volume and price filters, gap rule, enabled flag, "
+            "the last alert it sent, and its health (live, data type, seconds since the last "
+            "tick, in hours, market reference fresh). Also the engine's own state: heartbeat "
+            "age, dry run, gateway connected, rules accepted. Recipients appear as counts "
+            "only. Call this first for the watch ids the other alert tools take, and to tell "
+            "whether a silent watch is quiet or blind."),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": pricealerts.TOOL_HISTORY,
+        "title": "Price alert history",
+        "description": (
+            "Alerts the engine fired, newest first, with the figures at the moment of firing "
+            "(move, volume multiple, market move, prices) and whether each was sent, logged "
+            "in dry run or failed. Defaults to the last 7 days. At most "
+            f"{pricealerts.HISTORY_CAP} rows; truncated is true when more matched."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "start": {"type": ["string", "integer"], "description":
+                          "ISO date, ISO 8601 timestamp or epoch seconds. Default 7 days "
+                          "before end."},
+                "end": {"type": ["string", "integer"], "description":
+                        "ISO date (covers that whole day), ISO 8601 timestamp or epoch "
+                        "seconds. Default now."},
+                "watch": _WATCH_ARG,
+                "limit": {"type": "integer", "minimum": 1, "maximum": pricealerts.HISTORY_CAP,
+                          "description": "Rows to return. Default 50."},
+            },
+            "required": [],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": pricealerts.TOOL_TEST,
+        "title": "Test price alert thresholds",
+        "description": (
+            "Replay one past trading day from the stored one-minute bars through the alert "
+            "rules and return what would have fired, minute by minute. Pass overrides to try "
+            "proposed thresholds before changing anything; they take the same fields and "
+            "bounds as ibkr_update_price_alert, keyed by watch id. Nothing is written and "
+            "nothing is sent. A day with no stored bars comes back with bars 0 and a note. "
+            "Runs for at most 30 seconds."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$",
+                         "description": "The trading day, YYYY-MM-DD."},
+                "watch": _WATCH_ARG,
+                "overrides": {"type": "object", "description":
+                              "Keyed by watch id, each value a partial watch. " + _CHANGES_DESC},
+            },
+            "required": ["date"],
+        },
+        "annotations": _READ_ONLY,
+    },
+    {
+        "name": pricealerts.TOOL_UPDATE,
+        "title": "Change a price alert",
+        "description": (
+            "Change thresholds or the enabled flag of one watch. Only tier numbers and "
+            "require lists, the volume and spread filters, the gap thresholds and enabled "
+            "can change; instruments, hours, the cooldown and recipients cannot. Returns the "
+            "watch before and after and the dotted paths that changed; the engine applies it "
+            "within one minute. Read the change back to the person and test it with "
+            "ibkr_test_price_alert first. Needs a token with write access."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "watch": _WATCH_ARG,
+                "changes": {"type": "object", "description": _CHANGES_DESC},
+            },
+            "required": ["watch", "changes"],
+        },
+        "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                        "idempotentHint": True, "openWorldHint": False},
+    },
+]
+
+
+def listed_tools(env=None) -> list:
+    """The tool table this server offers right now."""
+    if pricealerts.enabled(env):
+        return TOOLS + PRICE_ALERT_TOOLS
+    return TOOLS
+
+
+def _price_alert_call(name, args, ctx, can_write):
+    cfg = pricealerts.Config.from_env(ibkr_root=store.root(ctx.root_dir), ibkr_dir=HERE)
+    try:
+        return pricealerts.call(name, args, cfg, ctx.now(), can_write=can_write,
+                                runner=ctx.runner)
+    except pricealerts.ToolError as exc:
+        return fail(exc.code, exc.message, exc.next_action, **exc.extra)
+
 INSTRUCTIONS = (
     "Read-only market data from Interactive Brokers for stocks, options, indexes, "
     "FX, futures and futures options: quotes and option Greeks (live where the "
@@ -1452,15 +1606,25 @@ INSTRUCTIONS = (
 # dispatch
 # --------------------------------------------------------------------------
 
-def call_tool(name, args, ctx=None):
-    """Run one tool and wrap it in the MCP content envelope."""
-    if name not in TOOL_HANDLERS:
-        raise RpcError(E_INVALID_PARAMS, f"Unknown tool: {name}", {"available": TOOL_NAMES})
+def call_tool(name, args, ctx=None, can_write=None):
+    """Run one tool and wrap it in the MCP content envelope.
+
+    ``can_write`` is the write flag of the token that authorised an HTTP
+    request. Stdio has no token and passes None, and the price-alert module
+    then reads LACUNA_PRICE_ALERTS_STDIO_WRITE.
+    """
+    price_alert = name in pricealerts.TOOL_NAMES and pricealerts.enabled()
+    if name not in TOOL_HANDLERS and not price_alert:
+        raise RpcError(E_INVALID_PARAMS, f"Unknown tool: {name}",
+                       {"available": [t["name"] for t in listed_tools()]})
     if not isinstance(args, dict):
         raise RpcError(E_INVALID_PARAMS, "arguments must be an object")
 
     try:
-        payload = TOOL_HANDLERS[name](args, ctx or DEFAULT_CTX)
+        if price_alert:
+            payload = _price_alert_call(name, args, ctx or DEFAULT_CTX, can_write)
+        else:
+            payload = TOOL_HANDLERS[name](args, ctx or DEFAULT_CTX)
     except RpcError:
         raise
     except Exception as exc:
@@ -1533,7 +1697,7 @@ class Session:
         return self.era
 
 
-def dispatch(session, method, params):
+def dispatch(session, method, params, can_write=None):
     params = params if isinstance(params, dict) else {}
     era = session.request_era(params)
 
@@ -1560,14 +1724,14 @@ def dispatch(session, method, params):
         return complete_result({}, era)
 
     if method == "tools/list":
-        return complete_result({"tools": TOOLS}, era, ttl_ms=CACHE_TTL_MS)
+        return complete_result({"tools": listed_tools()}, era, ttl_ms=CACHE_TTL_MS)
 
     if method == "tools/call":
         name = params.get("name")
         if not isinstance(name, str) or not name:
             raise RpcError(E_INVALID_PARAMS, "tools/call needs a name")
         return complete_result(call_tool(name, params.get("arguments") or {},
-                                         session.ctx), era)
+                                         session.ctx, can_write=can_write), era)
 
     raise RpcError(E_METHOD_NOT_FOUND, f"Method not found: {method}")
 
@@ -1599,8 +1763,12 @@ def rpc_error(req_id, code, message, data=None):
     return {"jsonrpc": "2.0", "id": req_id, "error": err}
 
 
-def handle_message(session, message):
-    """One parsed message to one response, or None for a notification."""
+def handle_message(session, message, can_write=None):
+    """One parsed message to one response, or None for a notification.
+
+    ``can_write`` is the authorising token's write flag over HTTP, and None on
+    stdio, where there is no token.
+    """
     if isinstance(message, list):
         # Batching was removed from MCP in 2025-06-18 and was never supported
         # here, so it is refused plainly rather than half-handled.
@@ -1619,7 +1787,7 @@ def handle_message(session, message):
         return None
 
     try:
-        result = dispatch(session, method, params)
+        result = dispatch(session, method, params, can_write=can_write)
     except RpcError as exc:
         log(f"rpc error method={method} code={exc.code} {exc.message}")
         return rpc_error(req_id, exc.code, exc.message, exc.data)
@@ -1675,7 +1843,7 @@ def main(argv=None):
 
     ctx = Ctx(root_dir=args.root)
     if args.selftest:
-        print(json.dumps({"tools": TOOL_NAMES,
+        print(json.dumps({"tools": [t["name"] for t in listed_tools()],
                           "status": tool_status({}, ctx)},
                          indent=2, default=str))
         return 0

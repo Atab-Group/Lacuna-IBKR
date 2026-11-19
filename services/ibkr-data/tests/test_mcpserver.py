@@ -475,3 +475,127 @@ def test_login_config_hosted_wording():
     assert "Nic has already been emailed" in sentence
     assert "page password" in sentence and "https://example.test/login/" in sentence
     assert "Never ask for IBKR credentials" in sentence
+
+
+# ------------------------------------------------- optional price alerts ----
+
+import pricealert_fixture as pafix  # noqa: E402
+
+PRICE_ALERT_NAMES = ["ibkr_get_live_tape", "ibkr_list_price_alerts",
+                     "ibkr_list_price_alert_history", "ibkr_test_price_alert",
+                     "ibkr_update_price_alert"]
+
+
+@pytest.fixture()
+def price_alerts_on(tmp_path, monkeypatch):
+    """The engine's files in tmp_path, and the env that switches the tools on."""
+    cfg = pafix.build(tmp_path)
+    for name, value in pafix.env_for(cfg).items():
+        monkeypatch.setenv(name, value)
+    return cfg
+
+
+def frozen_ctx(root, runner=None):
+    ctx = down_ctx(root, now=pafix.NOW)
+    ctx.runner = runner
+    return ctx
+
+
+def test_without_the_switch_the_tool_list_is_unchanged(tmp_path):
+    session = mcp.Session(down_ctx(tmp_path))
+    listed = mcp.handle_message(session, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    names = [t["name"] for t in listed["result"]["tools"]]
+    assert len(names) == 14
+    assert names == mcp.TOOL_NAMES
+    assert not set(names) & set(PRICE_ALERT_NAMES)
+
+
+@pytest.mark.parametrize("name", PRICE_ALERT_NAMES)
+def test_without_the_switch_each_name_is_an_unknown_tool(tmp_path, name):
+    with pytest.raises(mcp.RpcError) as caught:
+        mcp.call_tool(name, {}, down_ctx(tmp_path))
+    assert caught.value.code == mcp.E_INVALID_PARAMS
+    assert name not in caught.value.data["available"]
+
+
+def test_with_the_switch_five_tools_follow_the_fourteen(tmp_path, price_alerts_on):
+    session = mcp.Session(down_ctx(tmp_path))
+    listed = mcp.handle_message(session, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    tools = listed["result"]["tools"]
+    assert [t["name"] for t in tools] == mcp.TOOL_NAMES + PRICE_ALERT_NAMES
+    by_name = {t["name"]: t for t in tools}
+    for name in PRICE_ALERT_NAMES:
+        assert len(by_name[name]["description"]) > 40
+        assert by_name[name]["inputSchema"]["type"] == "object"
+        assert by_name[name]["title"]
+    for name in PRICE_ALERT_NAMES[:4]:
+        assert by_name[name]["annotations"]["readOnlyHint"] is True
+    assert by_name["ibkr_update_price_alert"]["annotations"]["readOnlyHint"] is False
+    assert by_name["ibkr_get_live_tape"]["inputSchema"]["required"] == ["watch"]
+    assert by_name["ibkr_update_price_alert"]["inputSchema"]["required"] == ["watch", "changes"]
+    assert "ibkr_get_bars" in by_name["ibkr_get_live_tape"]["description"]
+
+
+def test_a_price_alert_tool_returns_structured_content(tmp_path, price_alerts_on):
+    result = mcp.call_tool("ibkr_list_price_alerts", {}, frozen_ctx(tmp_path))
+    assert result["isError"] is False
+    payload = result["structuredContent"]
+    assert [w["id"] for w in payload["watches"]] == ["example-watch", "example-adr"]
+    assert payload["recipients"] == {"email": 2, "whatsapp": 1}
+    pafix.assert_no_recipient(result)
+
+
+def test_a_price_alert_failure_uses_the_error_contract(tmp_path, price_alerts_on):
+    price_alerts_on.heartbeat_path.unlink()
+    result = mcp.call_tool("ibkr_get_live_tape", {"watch": "example-watch"},
+                           frozen_ctx(tmp_path))
+    assert result["isError"] is True
+    error = result["structuredContent"]["error"]
+    assert error["code"] == "price_alerts_unavailable"
+    assert error["next_action"]
+
+
+def test_the_backtest_gets_this_servers_store_and_code_paths(tmp_path, price_alerts_on):
+    seen = []
+
+    def runner(argv, env, timeout):
+        seen.append(env)
+        return 0, '{"date": "2026-03-04", "watches": []}', ""
+
+    result = mcp.call_tool("ibkr_test_price_alert", {"date": "2026-03-04"},
+                           frozen_ctx(tmp_path, runner))
+    assert result["structuredContent"] == {"date": "2026-03-04", "watches": []}
+    assert seen[0]["LACUNA_IBKR_ROOT"] == str(store.root(str(tmp_path)))
+    assert seen[0]["LACUNA_IBKR_DIR"] == str(mcp.HERE)
+    assert seen[0]["PRICE_ALERTS_RULES"] == str(price_alerts_on.rules_path)
+
+
+UPDATE = {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+          "params": {"name": "ibkr_update_price_alert",
+                     "arguments": {"watch": "example-watch",
+                                   "changes": {"enabled": False}}}}
+
+
+def test_stdio_update_is_refused_without_the_operator_switch(tmp_path, price_alerts_on):
+    session = mcp.Session(frozen_ctx(tmp_path))
+    reply = mcp.handle_message(session, UPDATE)
+    assert reply["result"]["isError"] is True
+    error = reply["result"]["structuredContent"]["error"]
+    assert error["code"] == "write_not_allowed"
+    assert "write token" in error["next_action"]
+
+
+def test_stdio_update_with_the_operator_switch(tmp_path, price_alerts_on, monkeypatch):
+    monkeypatch.setenv("LACUNA_PRICE_ALERTS_STDIO_WRITE", "1")
+    session = mcp.Session(frozen_ctx(tmp_path))
+    reply = mcp.handle_message(session, UPDATE)
+    assert reply["result"]["isError"] is False
+    assert reply["result"]["structuredContent"]["changed"] == ["enabled"]
+
+
+def test_a_read_token_flag_is_refused_even_with_the_stdio_switch(tmp_path, price_alerts_on,
+                                                                  monkeypatch):
+    monkeypatch.setenv("LACUNA_PRICE_ALERTS_STDIO_WRITE", "1")
+    session = mcp.Session(frozen_ctx(tmp_path))
+    reply = mcp.handle_message(session, UPDATE, can_write=False)
+    assert reply["result"]["structuredContent"]["error"]["code"] == "write_not_allowed"
