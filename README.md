@@ -165,7 +165,14 @@ LACUNA_PRICE_ALERTS_DIR=/path/to/engine/state        # holds tape.db and heartbe
 LACUNA_PRICE_ALERTS_RULES=/path/to/price-alerts.json  # the engine's rules file
 LACUNA_PRICE_ALERTS_BACKTEST=/path/to/backtest.py     # optional
 LACUNA_PRICE_ALERTS_PYTHON=/path/to/python            # optional, default this server's
+LACUNA_PRICE_ALERTS_VALIDATOR=/path/to/config.py      # optional, the engine's own rules check
 ```
+
+Before a change is written, the merged rules file is checked whole against the
+engine's field and cross-field rules, so the tool never writes a file the engine
+would ignore. With `LACUNA_PRICE_ALERTS_VALIDATOR` set, the engine's own
+`config.py --check` also runs on the new file before it replaces the old one,
+and a refusal there leaves the old file in place.
 
 Reading needs any token. Changing a threshold needs a token minted with write
 access:

@@ -486,9 +486,9 @@ def test_concurrent_updates_through_the_lock_all_land(cfg, monkeypatch):
     """
     real_write = pa._atomic_write
 
-    def slow_write(path, text):
+    def slow_write(path, text, **kw):
         time.sleep(0.05)
-        real_write(path, text)
+        real_write(path, text, **kw)
 
     monkeypatch.setattr(pa, "_atomic_write", slow_write)
     changes = [
@@ -697,3 +697,479 @@ def test_no_tool_result_carries_a_recipient(cfg):
     ]
     for result in results:
         assert_no_recipient(result)
+
+
+# ================================================================ review fixes ====
+# Each block below names the finding it covers. Every case was seen red on the code
+# before the fix, except the finding 6 checks, which confirm behaviour that held.
+
+import copy
+import dataclasses
+import sqlite3
+
+from pricealert_fixture import EMAIL_TWO, HEARTBEAT
+
+WATCH_PLAIN = {
+    "id": "example-plain",
+    "label": "Example stock with no market check",
+    "subject": "example-subject",
+    "enabled": True,
+    "contract": {"symbol": "NVDA", "sec_type": "STK", "exchange": "SMART", "currency": "USD"},
+    "hours": {"tz": "America/New_York", "open": "09:30", "close": "16:00"},
+    "price": {"source": "last", "lookback_min": 3},
+    "volume": {"window_min": 1, "baseline": "median", "baseline_min": 30},
+    "tiers": {
+        "early": {"move_pct": 0.75, "volume_x": 4, "require": ["price", "volume"]},
+        "firm": {"move_pct": 1.5, "volume_x": 8, "require": ["price", "volume"]},
+    },
+}
+
+
+def rules_with(*watches, **top):
+    rules = copy.deepcopy(RULES)
+    rules["watches"] = [copy.deepcopy(w) for w in watches] or rules["watches"]
+    rules.update(top)
+    return rules
+
+
+@pytest.fixture()
+def cfg3(tmp_path):
+    """The two fixture watches plus one with no market object."""
+    return build(tmp_path, rules=rules_with(WATCH_ONE, WATCH_TWO, WATCH_PLAIN))
+
+
+def leftovers(cfg):
+    return sorted(p.name for p in cfg.rules_path.parent.iterdir())
+
+
+# ------------------------------------------- finding 1: cross-field rules ----
+
+@pytest.mark.parametrize("watch,changes,path", [
+    ("example-adr", {"gap": {"rearm_pct": 2.0}}, "gap.rearm_pct"),
+    ("example-adr", {"gap": {"move_pct": 0.5}}, "gap.rearm_pct"),
+    ("example-watch", {"tiers": {"early": {"require": ["market"]}}}, "tiers.early.require"),
+    ("example-watch", {"tiers": {"firm": {"require": ["market"]}}}, "tiers.firm.require"),
+    ("example-plain", {"tiers": {"early": {"require": ["price", "market"]}}},
+     "tiers.early.require"),
+    ("example-plain", {"tiers": {"firm": {"require": ["market"]}}}, "tiers.firm.require"),
+    ("example-plain", {"gap": {"step_pct": 0.5}}, "gap.step_pct"),
+])
+def test_update_refuses_a_cross_field_break(cfg3, watch, changes, path):
+    text = cfg3.rules_path.read_text()
+    err = error_of(cfg3, pa.TOOL_UPDATE, {"watch": watch, "changes": changes}, can_write=True)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == path
+    assert cfg3.rules_path.read_text() == text
+
+
+def test_update_refuses_when_an_untouched_tier_already_breaks_a_rule(tmp_path):
+    plain = copy.deepcopy(WATCH_PLAIN)
+    plain["tiers"]["firm"]["require"] = ["market"]
+    cfg = build(tmp_path, rules=rules_with(WATCH_ONE, plain))
+    text = cfg.rules_path.read_text()
+    err = error_of(cfg, pa.TOOL_UPDATE,
+                   {"watch": "example-plain", "changes": {"enabled": False}}, can_write=True)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == "tiers.firm.require"
+    assert cfg.rules_path.read_text() == text
+
+
+@pytest.mark.parametrize("changes,expected", [
+    ({"price": {"max_spread_pct": 0.5}},
+     {"source": "last", "lookback_min": 3, "max_spread_pct": 0.5}),
+    ({"volume": {"min_dollars": 1000}},
+     {"window_min": 1, "baseline": "median", "baseline_min": 30, "min_dollars": 1000}),
+])
+def test_update_adds_a_floor_or_filter_that_was_absent(cfg3, changes, expected):
+    out = call(cfg3, pa.TOOL_UPDATE, {"watch": "example-plain", "changes": changes},
+               can_write=True)
+    section = next(iter(changes))
+    assert out["after"][section] == expected
+    assert rules_on_disk(cfg3)["watches"][2][section] == expected
+
+
+def test_update_accepts_require_with_market_when_the_watch_has_a_market(cfg3):
+    out = call(cfg3, pa.TOOL_UPDATE,
+               {"watch": "example-watch",
+                "changes": {"tiers": {"early": {"require": ["volume", "market"]}}}},
+               can_write=True)
+    assert out["changed"] == ["tiers.early.require"]
+
+
+@pytest.mark.parametrize("overrides,path", [
+    ({"example-adr": {"gap": {"rearm_pct": 2.0}}}, "overrides.example-adr.gap.rearm_pct"),
+    ({"example-plain": {"tiers": {"early": {"require": ["market"]}}}},
+     "overrides.example-plain.tiers.early.require"),
+    ({"example-watch": {"tiers": {"firm": {"require": ["market"]}}}},
+     "overrides.example-watch.tiers.firm.require"),
+])
+def test_backtest_overrides_obey_the_cross_field_rules(cfg3, overrides, path):
+    runner = FakeRunner()
+    err = error_of(cfg3, pa.TOOL_TEST, {"date": "2026-03-04", "overrides": overrides},
+                   runner=runner)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == path
+    assert runner.calls == []
+
+
+# ---------------------------- finding 1: the whole-file safety net, local ----
+
+def test_the_fixture_rules_pass_the_local_check():
+    pa.check_rules(copy.deepcopy(RULES))
+    pa.check_rules(rules_with(WATCH_ONE, WATCH_TWO, WATCH_PLAIN))
+
+
+def _set(rules, dotted, value):
+    node = rules
+    parts = dotted.split(".")
+    for part in parts[:-1]:
+        node = node[int(part)] if isinstance(node, list) else node[part]
+    if value is _DROP:
+        del node[parts[-1]]
+    else:
+        node[parts[-1]] = value
+
+
+_DROP = object()
+
+
+@pytest.mark.parametrize("dotted,value,field", [
+    ("v", 2, "v"),
+    ("cooldown_min", 0, "cooldown_min"),
+    ("cooldown_min", _DROP, "cooldown_min"),
+    ("recipients.email", ["not-an-address"], "recipients.email"),
+    ("recipients.whatsapp", ["+1 555"], "recipients.whatsapp"),
+    ("watches.0.id", "Bad Id", "watches.0.id"),
+    ("watches.1.id", "example-watch", "watches.1.id"),
+    ("watches.0.subject", "", "watches.example-watch.subject"),
+    ("watches.0.enabled", "yes", "watches.example-watch.enabled"),
+    ("watches.0.no_tick_alarm_min", 121, "watches.example-watch.no_tick_alarm_min"),
+    ("watches.0.contract", {"exchange": "SMART"}, "watches.example-watch.contract"),
+    ("watches.0.hours.tz", "Mars/Base", "watches.example-watch.hours.tz"),
+    ("watches.0.hours.open", "9.30", "watches.example-watch.hours.open"),
+    ("watches.0.hours.close", "09:00", "watches.example-watch.hours"),
+    ("watches.0.price.source", "close", "watches.example-watch.price.source"),
+    ("watches.0.price.lookback_min", 31, "watches.example-watch.price.lookback_min"),
+    ("watches.0.volume.window_min", 2, "watches.example-watch.volume.window_min"),
+    ("watches.0.volume.baseline", "mode", "watches.example-watch.volume.baseline"),
+    ("watches.0.volume.baseline_min", 91, "watches.example-watch.volume.baseline_min"),
+    ("watches.1.volume.baseline_min", 31, "watches.example-adr.volume.baseline_min"),
+    ("watches.0.market.kind", "index", "watches.example-watch.market.kind"),
+    ("watches.0.market.symbol", "", "watches.example-watch.market.symbol"),
+    ("watches.1.market.min_fresh", 3, "watches.example-adr.market.min_fresh"),
+    ("watches.1.market.symbols", [], "watches.example-adr.market.symbols"),
+    ("watches.0.tiers.middle", {"move_pct": 1, "volume_x": 4},
+     "watches.example-watch.tiers"),
+    ("watches.0.tiers.early.move_pct", _DROP, "watches.example-watch.tiers.early.move_pct"),
+    ("watches.0.tiers.firm.volume_x", 101, "watches.example-watch.tiers.firm.volume_x"),
+    ("watches.1.gap.against", "no-such-watch", "watches.example-adr.gap.against"),
+    ("watches.1.gap.against", "example-adr", "watches.example-adr.gap.against"),
+    ("watches.1.gap.ratio", 0, "watches.example-adr.gap.ratio"),
+    ("watches.1.gap.fx", {}, "watches.example-adr.gap.fx"),
+    ("watches.1.price.source", "last", "watches.example-adr.gap"),
+])
+def test_the_local_check_names_the_field_at_fault(dotted, value, field):
+    rules = copy.deepcopy(RULES)
+    _set(rules, dotted, value)
+    with pytest.raises(pa.ToolError) as caught:
+        pa.check_rules(rules)
+    assert caught.value.code == "bad_argument"
+    assert caught.value.extra["path"] == "rules"
+    assert caught.value.extra["field"] == field
+
+
+@pytest.mark.parametrize("dotted,value", [
+    ("watches.0.hours.tz", "Mars/Base"),
+    ("watches.1.gap.against", "no-such-watch"),
+    ("cooldown_min", 0),
+])
+def test_update_refuses_to_write_a_file_the_engine_would_ignore(tmp_path, dotted, value):
+    rules = copy.deepcopy(RULES)
+    _set(rules, dotted, value)
+    cfg = build(tmp_path, rules=rules)
+    text = cfg.rules_path.read_text()
+    err = error_of(cfg, pa.TOOL_UPDATE,
+                   {"watch": "example-watch", "changes": {"enabled": False}}, can_write=True)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == "rules"
+    assert cfg.rules_path.read_text() == text
+    assert leftovers(cfg) == ["price-alerts.json", "price-alerts.json.lock"]
+
+
+# ------------------------- finding 1: the engine's own check, when named ----
+
+class ValidatorRunner(FakeRunner):
+    """Records what the temp file held when the validator was asked about it."""
+
+    def __call__(self, argv, env, timeout):
+        self.seen = json.loads(open(argv[-1]).read())
+        return super().__call__(argv, env, timeout)
+
+
+@pytest.fixture()
+def vcfg(cfg, tmp_path):
+    script = tmp_path / "config.py"
+    script.write_text("raise SystemExit(0)\n")
+    return dataclasses.replace(cfg, validator_path=script)
+
+
+def test_config_reads_the_validator_env_name():
+    cfg = pa.Config.from_env({"LACUNA_PRICE_ALERTS_DIR": "/srv/example/state",
+                              "LACUNA_PRICE_ALERTS_VALIDATOR": "/srv/example/config.py"})
+    assert str(cfg.validator_path) == "/srv/example/config.py"
+    assert pa.Config.from_env({"LACUNA_PRICE_ALERTS_DIR": "/s"}).validator_path is None
+
+
+def test_the_engine_check_runs_on_the_temp_file_before_the_rename(vcfg):
+    runner = ValidatorRunner(code=0, stdout="")
+    out = call(vcfg, pa.TOOL_UPDATE,
+               {"watch": "example-watch", "changes": {"enabled": False}},
+               can_write=True, runner=runner)
+    assert out["changed"] == ["enabled"]
+    [(argv, env, timeout)] = runner.calls
+    assert argv[:3] == ["/opt/example/bin/python", str(vcfg.validator_path), "--check"]
+    assert os.path.dirname(argv[3]) == str(vcfg.rules_path.parent)
+    assert argv[3] != str(vcfg.rules_path)
+    assert timeout == 10
+    assert runner.seen["watches"][0]["enabled"] is False
+    assert rules_on_disk(vcfg)["watches"][0]["enabled"] is False
+    assert leftovers(vcfg) == ["price-alerts.json", "price-alerts.json.lock"]
+
+
+def test_an_engine_check_refusal_writes_nothing_and_is_scrubbed(vcfg):
+    text = vcfg.rules_path.read_text()
+    runner = ValidatorRunner(
+        code=2, stdout=f"watch example-watch.tiers: bad, sent to {EMAIL_ONE}\nsecond line\n")
+    err = error_of(vcfg, pa.TOOL_UPDATE,
+                   {"watch": "example-watch", "changes": {"enabled": False}},
+                   can_write=True, runner=runner)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == "rules"
+    assert err.message == ("the engine's own check refused the merged rules: "
+                           "watch example-watch.tiers: bad, sent to [recipient]")
+    assert vcfg.rules_path.read_text() == text
+    assert leftovers(vcfg) == ["price-alerts.json", "price-alerts.json.lock"]
+
+
+@pytest.mark.parametrize("runner", [
+    FakeRunner(code=1, stdout="", stderr="Traceback"),
+    FakeRunner(raises=subprocess.TimeoutExpired(["python"], 10)),
+    FakeRunner(raises=OSError(2, "No such file")),
+])
+def test_an_engine_check_that_cannot_answer_writes_nothing(vcfg, runner):
+    text = vcfg.rules_path.read_text()
+    err = error_of(vcfg, pa.TOOL_UPDATE,
+                   {"watch": "example-watch", "changes": {"enabled": False}},
+                   can_write=True, runner=runner)
+    assert err.code == "validator_failed"
+    assert vcfg.rules_path.read_text() == text
+    assert leftovers(vcfg) == ["price-alerts.json", "price-alerts.json.lock"]
+
+
+def test_a_named_validator_that_is_missing_writes_nothing(vcfg):
+    vcfg.validator_path.unlink()
+    text = vcfg.rules_path.read_text()
+    err = error_of(vcfg, pa.TOOL_UPDATE,
+                   {"watch": "example-watch", "changes": {"enabled": False}},
+                   can_write=True, runner=lambda *a: pytest.fail("the runner must not start"))
+    assert err.code == "price_alerts_unavailable"
+    assert vcfg.rules_path.read_text() == text
+
+
+def test_no_validator_named_means_no_subprocess(cfg):
+    out = call(cfg, pa.TOOL_UPDATE, {"watch": "example-watch", "changes": {"enabled": False}},
+               can_write=True, runner=lambda *a: pytest.fail("the runner must not start"))
+    assert out["changed"] == ["enabled"]
+
+
+def test_the_real_runner_runs_a_validator_script(tmp_path):
+    cfg = build(tmp_path)
+    script = tmp_path / "check.py"
+    script.write_text("import json, sys\n"
+                      "rules = json.load(open(sys.argv[2]))\n"
+                      "if rules['watches'][0]['enabled'] is False:\n"
+                      "    print('watch example-watch.enabled: refused by the example check')\n"
+                      "    raise SystemExit(2)\n")
+    cfg = dataclasses.replace(cfg, python=sys.executable, validator_path=script)
+    err = error_of(cfg, pa.TOOL_UPDATE,
+                   {"watch": "example-watch", "changes": {"enabled": False}}, can_write=True)
+    assert err.code == "bad_argument"
+    assert err.message.endswith("watch example-watch.enabled: refused by the example check")
+    out = call(cfg, pa.TOOL_UPDATE,
+               {"watch": "example-watch", "changes": {"tiers": {"early": {"move_pct": 0.8}}}},
+               can_write=True)
+    assert out["changed"] == ["tiers.early.move_pct"]
+
+
+# --------------------------------------- finding 2: errors are scrubbed too ----
+
+def test_a_backtest_refusal_is_scrubbed(cfg):
+    runner = FakeRunner(code=2, stdout=json.dumps({"error": f"cannot send to {EMAIL_ONE}"}))
+    err = error_of(cfg, pa.TOOL_TEST, {"date": "2026-03-04"}, runner=runner)
+    assert err.code == "backtest_failed"
+    assert err.message == "the backtest refused: cannot send to [recipient]"
+
+
+def test_a_backtest_stderr_tail_is_scrubbed(cfg):
+    runner = FakeRunner(code=1, stdout="", stderr=f"Traceback: bad number {PHONE}")
+    err = error_of(cfg, pa.TOOL_TEST, {"date": "2026-03-04"}, runner=runner)
+    assert err.extra["stderr_tail"] == "Traceback: bad number [recipient]"
+
+
+def test_a_backtest_start_failure_is_scrubbed(cfg):
+    runner = FakeRunner(raises=OSError(2, f"No such file: /x/{EMAIL_TWO}"))
+    err = error_of(cfg, pa.TOOL_TEST, {"date": "2026-03-04"}, runner=runner)
+    assert err.code == "price_alerts_unavailable"
+    assert EMAIL_TWO not in err.message
+    assert "[recipient]" in err.message
+
+
+def test_an_unexpected_exception_leaves_as_a_scrubbed_tool_error(cfg):
+    runner = FakeRunner(raises=ValueError(f"odd value for {PHONE}"))
+    err = error_of(cfg, pa.TOOL_TEST, {"date": "2026-03-04"}, runner=runner)
+    assert err.code == "price_alert_tool_failed"
+    assert err.message == "ValueError: odd value for [recipient]"
+
+
+def test_with_the_rules_unreadable_an_error_carries_no_free_text(cfg):
+    cfg.rules_path.write_text(f'{{"recipients": {{"email": ["{EMAIL_ONE}"]}}, "watches": 3')
+    err = error_of(cfg, pa.TOOL_LIST)
+    assert err.code == "price_alerts_unavailable"
+    assert err.message == ("the price-alert engine's files could not be read, and the rules "
+                           "file could not be read to check the details for recipient values")
+    assert err.extra == {}
+    assert "operator" in err.next_action
+
+
+def test_with_the_rules_unreadable_a_tape_error_carries_no_free_text(cfg):
+    cfg.rules_path.unlink()
+    cfg.tape_path.unlink()
+    err = error_of(cfg, pa.TOOL_HISTORY)
+    assert err.code == "price_alerts_unavailable"
+    assert "tape.db" not in err.message
+    assert err.extra == {}
+
+
+# ----------------------------------- finding 3: dotted keys are normalised ----
+
+def test_backtest_overrides_with_dotted_keys_are_passed_on_nested(cfg):
+    runner = FakeRunner()
+    call(cfg, pa.TOOL_TEST,
+         {"date": "2026-03-04",
+          "overrides": {"example-watch": {"tiers.early.move_pct": 0.5,
+                                          "tiers.firm": {"volume_x": 9}}}},
+         runner=runner)
+    argv = runner.calls[0][0]
+    assert argv[argv.index("--overrides") + 1] == (
+        '{"example-watch":{"tiers":{"early":{"move_pct":0.5},"firm":{"volume_x":9}}}}')
+
+
+def test_update_with_dotted_keys_writes_nested_fields(cfg):
+    out = call(cfg, pa.TOOL_UPDATE,
+               {"watch": "example-watch", "changes": {"tiers.early.move_pct": 0.5}},
+               can_write=True)
+    assert out["changed"] == ["tiers.early.move_pct"]
+    watch = rules_on_disk(cfg)["watches"][0]
+    assert watch["tiers"]["early"] == {"move_pct": 0.5, "volume_x": 4,
+                                       "require": ["price", "volume", "market"]}
+    assert "tiers.early.move_pct" not in watch
+
+
+@pytest.mark.parametrize("changes", [
+    {"tiers.early.move_pct": 0.5, "tiers": {"early": {"move_pct": 0.6}}},
+    {"tiers": {"early": {"move_pct": 0.5}}, "tiers.early": {"move_pct": 0.5}},
+])
+def test_a_dotted_and_a_nested_key_for_one_path_are_refused(cfg, changes):
+    text = cfg.rules_path.read_text()
+    err = error_of(cfg, pa.TOOL_UPDATE, {"watch": "example-watch", "changes": changes},
+                   can_write=True)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == "tiers.early.move_pct"
+    assert cfg.rules_path.read_text() == text
+    runner = FakeRunner()
+    err = error_of(cfg, pa.TOOL_TEST,
+                   {"date": "2026-03-04", "overrides": {"example-watch": changes}},
+                   runner=runner)
+    assert err.extra["path"] == "overrides.example-watch.tiers.early.move_pct"
+    assert runner.calls == []
+
+
+# ------------------------------------------ finding 4: a huge integer ----
+
+@pytest.mark.parametrize("changes,path", [
+    ({"tiers": {"early": {"move_pct": 10 ** 400}}}, "tiers.early.move_pct"),
+    ({"volume": {"min_trades": 10 ** 400}}, "volume.min_trades"),
+    ({"volume": {"min_dollars": -(10 ** 400)}}, "volume.min_dollars"),
+])
+def test_update_refuses_a_huge_integer_by_path(cfg, changes, path):
+    err = error_of(cfg, pa.TOOL_UPDATE, {"watch": "example-watch", "changes": changes},
+                   can_write=True)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == path
+
+
+@pytest.mark.parametrize("args,path", [
+    ({"start": 10 ** 400}, "start"), ({"end": 10 ** 400}, "end"),
+    ({"start": float("inf")}, "start"), ({"start": "9" * 400}, "start"),
+])
+def test_history_refuses_a_huge_epoch_by_path(cfg, args, path):
+    err = error_of(cfg, pa.TOOL_HISTORY, args)
+    assert err.code == "bad_argument"
+    assert err.extra["path"] == path
+
+
+# ---------------------------------------- finding 5: a symlinked rules file ----
+
+def test_update_through_a_symlink_keeps_the_link_and_changes_the_target(cfg, tmp_path):
+    target_dir = tmp_path / "real"
+    target_dir.mkdir()
+    target = target_dir / "rules.json"
+    target.write_text(cfg.rules_path.read_text())
+    target.chmod(0o640)
+    cfg.rules_path.unlink()
+    cfg.rules_path.symlink_to(target)
+
+    call(cfg, pa.TOOL_UPDATE, {"watch": "example-watch", "changes": {"enabled": False}},
+         can_write=True)
+    assert cfg.rules_path.is_symlink()
+    assert os.readlink(cfg.rules_path) == str(target)
+    assert json.loads(target.read_text())["watches"][0]["enabled"] is False
+    assert oct(os.stat(target).st_mode & 0o777) == "0o640"
+    assert sorted(p.name for p in target_dir.iterdir()) == ["rules.json"]
+
+
+# ------------------------------------ finding 6: the engine adds fields ----
+
+def test_extra_heartbeat_fields_and_tape_columns_are_tolerated(tmp_path):
+    heartbeat = copy.deepcopy(HEARTBEAT)
+    heartbeat["started_ts"] = 1795000000
+    heartbeat["instruments"]["example-watch"]["x_new"] = {"nested": True}
+    heartbeat["references"]["example-watch"]["x_new"] = 3
+    cfg = build(tmp_path, heartbeat=heartbeat)
+    conn = sqlite3.connect(cfg.tape_path)
+    conn.execute("ALTER TABLE minutes ADD COLUMN x_extra TEXT")
+    conn.execute("ALTER TABLE readings ADD COLUMN x_extra TEXT")
+    conn.execute("ALTER TABLE alerts ADD COLUMN x_extra TEXT")
+    conn.execute("INSERT INTO minutes (instrument, minute, last, source) "
+                 "VALUES ('ref:EXAMPLE', ?, 1.0, 'poll')", (NEWEST,))
+    conn.commit()
+    conn.close()
+
+    tape = call(cfg, pa.TOOL_LIVE_TAPE, {"watch": "example-watch", "minutes": 3})
+    assert [r["minute"] for r in tape["rows"]] == [1795099800, 1795099860, NEWEST]
+    assert "x_extra" not in tape["rows"][0]
+    listed = call(cfg, pa.TOOL_LIST)
+    assert [w["id"] for w in listed["watches"]] == ["example-watch", "example-adr"]
+    assert listed["engine"]["heartbeat_age_seconds"] == 10
+    history = call(cfg, pa.TOOL_HISTORY)
+    assert history["n_returned"] == 3
+
+
+def test_list_works_when_the_engine_reports_bad_rules(tmp_path):
+    heartbeat = copy.deepcopy(HEARTBEAT)
+    heartbeat["rules_ok"] = False
+    cfg = build(tmp_path, heartbeat=heartbeat)
+    out = call(cfg, pa.TOOL_LIST)
+    assert out["engine"]["rules_ok"] is False
+    assert len(out["watches"]) == 2
+    assert_no_recipient(out)

@@ -15,8 +15,13 @@
 - Tokens gain an optional `"write": true`. Only a write token may change a
   threshold; `--add-token NAME --write` mints one. Over stdio, writing needs
   `LACUNA_PRICE_ALERTS_STDIO_WRITE=1`.
+- `ibkr_update_price_alert` checks the whole merged rules file against the
+  engine's field and cross-field rules before it writes, and, when
+  `LACUNA_PRICE_ALERTS_VALIDATOR` names the engine's `config.py`, runs that
+  check on the new file before the rename. A dotted key in `changes` or
+  `overrides` is turned into a nested one. A symlinked rules file stays a link.
 - No tool returns who the alerts go to: the listing gives counts, and every
-  reply is scrubbed of recipient values.
+  reply, error replies included, is scrubbed of recipient values.
 - The market-data skill says when to use the tape in place of bars, and to
   test and read back a change before making it.
 

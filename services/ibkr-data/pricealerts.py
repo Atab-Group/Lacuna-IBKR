@@ -14,9 +14,11 @@ The interface is four names:
 - ``ToolError``: what ``call`` raises; ``mcpserver`` turns it into its usual error result.
 
 Three rules hold for every tool. Recipient addresses and numbers never leave this module: the
-listing returns counts, and every payload is scrubbed of any recipient value before it is
-returned. A result cut to a cap says so, with ``truncated`` and the cap. A missing or unreadable
-file is a ``price_alerts_unavailable`` error that names the file and says who acts next.
+listing returns counts, and every payload, a result or an error, is scrubbed of any recipient
+value before it leaves. A result cut to a cap says so, with ``truncated`` and the cap. A
+missing or unreadable file is a ``price_alerts_unavailable`` error that names the file and says
+who acts next. Before the rules file is rewritten, the whole merged file is checked against the
+engine's rules, so the writer never leaves a file the engine would ignore.
 
 Standard library only, like the rest of the service.
 """
@@ -42,6 +44,7 @@ ENV_RULES = "LACUNA_PRICE_ALERTS_RULES"
 ENV_BACKTEST = "LACUNA_PRICE_ALERTS_BACKTEST"
 ENV_PYTHON = "LACUNA_PRICE_ALERTS_PYTHON"
 ENV_STDIO_WRITE = "LACUNA_PRICE_ALERTS_STDIO_WRITE"
+ENV_VALIDATOR = "LACUNA_PRICE_ALERTS_VALIDATOR"
 
 DEFAULT_RULES = "~/.config/lacuna-ibkr/price-alerts.json"
 DEFAULT_BACKTEST = "~/price-alerts/services/price-alerts/backtest.py"
@@ -56,6 +59,8 @@ HISTORY_CAP = 200
 HISTORY_DEFAULT_DAYS = 7
 LIVE_TICK_SECONDS = 180
 BACKTEST_TIMEOUT_SECONDS = 30
+VALIDATOR_TIMEOUT_SECONDS = 10
+EPOCH_MAX = 253402300799         # 9999-12-31T23:59:59Z, the last second a datetime can hold
 
 TOOL_LIVE_TAPE = "ibkr_get_live_tape"
 TOOL_LIST = "ibkr_list_price_alerts"
@@ -145,6 +150,7 @@ class Config:
     python: str
     ibkr_root: str
     ibkr_dir: str
+    validator_path: Path | None = None   # the engine's config.py; None skips that check
 
     @property
     def tape_path(self) -> Path:
@@ -172,6 +178,8 @@ class Config:
             python=(env.get(ENV_PYTHON) or "").strip() or sys.executable,
             ibkr_root=str(ibkr_root),
             ibkr_dir=str(ibkr_dir),
+            validator_path=(path(ENV_VALIDATOR, "") if (env.get(ENV_VALIDATOR) or "").strip()
+                            else None),
         )
 
 
@@ -189,17 +197,41 @@ def write_allowed(can_write, env=None) -> bool:
 
 def call(name, args, cfg, now, can_write=None, runner=None, env=None) -> dict:
     """Run one price-alert tool. Raises ToolError for anything the caller must act on."""
+    runner = runner or run_subprocess
     handlers = {
         TOOL_LIVE_TAPE: lambda: live_tape(cfg, args, now),
         TOOL_LIST: lambda: list_alerts(cfg, now),
         TOOL_HISTORY: lambda: alert_history(cfg, args, now),
-        TOOL_TEST: lambda: backtest_alert(cfg, args, runner or run_subprocess),
-        TOOL_UPDATE: lambda: update_alert(cfg, args, write_allowed(can_write, env)),
+        TOOL_TEST: lambda: backtest_alert(cfg, args, runner),
+        TOOL_UPDATE: lambda: update_alert(cfg, args, write_allowed(can_write, env), runner),
     }
     if name not in handlers:
         raise KeyError(name)
-    payload = handlers[name]()
-    return redact(payload, _recipient_values(cfg))
+    try:
+        payload = handlers[name]()
+    except ToolError as exc:
+        raise _scrubbed_error(exc, _recipient_values(cfg)) from None
+    except Exception as exc:
+        # Anything else would reach the caller as raw exception text. Give it a code and
+        # send it through the same scrub.
+        failure = ToolError("price_alert_tool_failed", f"{type(exc).__name__}: {exc}",
+                            "Tell the operator this price-alert tool failed on the server. "
+                            "Do not retry until they say it is fixed.")
+        raise _scrubbed_error(failure, _recipient_values(cfg)) from None
+    return redact(payload, _recipient_values(cfg) or [])
+
+
+UNREADABLE_DETAIL = ("the price-alert engine's files could not be read, and the rules file "
+                     "could not be read to check the details for recipient values")
+
+
+def _scrubbed_error(exc, secrets):
+    """The error with every recipient value replaced. When the rules file could not be read,
+    nothing tells us what to scrub, so only the code, a fixed message and next_action stay."""
+    if secrets is None:
+        return ToolError(exc.code, UNREADABLE_DETAIL, exc.next_action)
+    return ToolError(exc.code, redact(exc.message, secrets), redact(exc.next_action, secrets),
+                     **redact(exc.extra, secrets))
 
 
 # --------------------------------------------------------------------------
@@ -263,12 +295,12 @@ def read_rules(cfg) -> dict:
     return _parse_rules(text, path)
 
 
-def _recipient_values(cfg) -> list[str]:
-    """Every recipient value in the rules file, for the scrub. Empty when unreadable."""
+def _recipient_values(cfg) -> list[str] | None:
+    """Every recipient value in the rules file, for the scrub. None when unreadable."""
     try:
         rules = read_rules(cfg)
     except ToolError:
-        return []
+        return None
     found = []
 
     def walk(node):
@@ -346,11 +378,11 @@ def _as_epoch(value, key, end_of_day=False) -> int:
         raise _bad(f"{key}: must be an ISO date, an ISO timestamp or epoch seconds",
                    "Pass a date such as 2026-03-04.", path=key)
     if isinstance(value, (int, float)):
-        return int(value)
+        return _epoch_in_range(value, key)
     if isinstance(value, str):
         text = value.strip()
         if text.isdigit():
-            return int(text)
+            return _epoch_in_range(int(text), key)
         if ISO_DATE.match(text):
             try:
                 day = date.fromisoformat(text)
@@ -370,6 +402,13 @@ def _as_epoch(value, key, end_of_day=False) -> int:
     raise _bad(f"{key}: {value!r} is not an ISO date, an ISO timestamp or epoch seconds",
                "Pass a date such as 2026-03-04 or a timestamp such as 2026-03-04T14:30:00Z.",
                path=key)
+
+
+def _epoch_in_range(value, key) -> int:
+    if isinstance(value, float) and not math.isfinite(value) or not 0 <= value <= EPOCH_MAX:
+        raise _bad(f"{key}: epoch seconds must be from 0 to {EPOCH_MAX}",
+                   "Pass a date such as 2026-03-04.", path=key)
+    return int(value)
 
 
 def _iso(ts):
@@ -588,7 +627,8 @@ def _check_value(path, value):
                        f"each at most once, got {value!r}",
                        f"Call again with {path} such as [\"price\", \"volume\"].", path=path)
         return list(value)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or isinstance(value, float) and not math.isfinite(value)):
         raise _bad(f"{path}: must be a number, got {value!r}",
                    f"Call again with {path} as a number from {low} to {high}.", path=path)
     if kind == "integer":
@@ -603,15 +643,22 @@ def _check_value(path, value):
     return value
 
 
-def _flatten_changes(changes, prefix=""):
-    """A partial watch to {dotted path: value}, refusing every path the writer may not touch."""
-    flat = {}
+def _flatten_changes(changes, prefix="", flat=None):
+    """A partial watch to {dotted path: value}, refusing every path the writer may not touch.
+
+    A key may be dotted (``"tiers.early.move_pct"``) or nested, or a mix of both. Two keys
+    that reach the same field are refused, because which one wins would be a guess.
+    """
+    flat = {} if flat is None else flat
     for key, value in changes.items():
         path = f"{prefix}{key}"
         if path in ALLOWED_FIELDS:
+            if path in flat:
+                raise _bad(f"{path}: given twice, once as a dotted key and once nested",
+                           f"Give {path} once, either dotted or nested.", path=path)
             flat[path] = _check_value(path, value)
         elif path in _ALLOWED_PREFIXES and isinstance(value, dict):
-            flat.update(_flatten_changes(value, path + "."))
+            _flatten_changes(value, path + ".", flat)
         else:
             raise _bad(f"{path}: this field cannot be changed through this tool",
                        "Change only tier thresholds and require lists, volume.min_trades, "
@@ -621,18 +668,81 @@ def _flatten_changes(changes, prefix=""):
     return flat
 
 
+def _nest(flat) -> dict:
+    """{dotted path: value} back to a nested object, the only shape the engine merges."""
+    out = {}
+    for path, value in flat.items():
+        *parents, leaf = path.split(".")
+        node = out
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[leaf] = copy.deepcopy(value)
+    return out
+
+
 def _same(old, new) -> bool:
     """Equal in value and in kind: 1 and 1.0 are the same threshold, true and 1 are not."""
     return old == new and isinstance(old, bool) == isinstance(new, bool)
 
 
-def plan_changes(watch, changes):
-    """Validate a partial watch against one watch. Returns (after, changed paths). Pure."""
+def _is_number(value) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and not (isinstance(value, float) and not math.isfinite(value)))
+
+
+def _cross_field_faults(watch):
+    """The cross-field rules of the engine contract, section 3, on one whole watch.
+
+    Yields (path, what is wrong, what to do). Fields that are absent or of the wrong type
+    are left to the field rules in ``check_rules``.
+    """
+    tiers = watch.get("tiers") if isinstance(watch.get("tiers"), dict) else {}
+    early = tiers.get("early") if isinstance(tiers.get("early"), dict) else {}
+    firm = tiers.get("firm") if isinstance(tiers.get("firm"), dict) else {}
+    for field in ("move_pct", "volume_x"):
+        lo, hi = early.get(field), firm.get(field)
+        if _is_number(lo) and _is_number(hi) and lo > hi:
+            yield (f"tiers.early.{field}", f"{lo} would exceed the firm tier's {hi}",
+                   f"Keep tiers.early.{field} at or below tiers.firm.{field}; change both "
+                   "in one call if both must move.")
+    has_market = isinstance(watch.get("market"), dict)
+    for name, tier in (("early", early), ("firm", firm)):
+        if "require" not in tier:
+            continue
+        path, require = f"tiers.{name}.require", tier["require"]
+        if (not isinstance(require, list) or not require
+                or any(not isinstance(r, str) or r not in REQUIRE_NAMES for r in require)
+                or len(set(require)) != len(require)):
+            yield (path, "must be a non-empty list drawn from price, volume and market, "
+                         "each at most once",
+                   f"Call again with {path} such as [\"price\", \"volume\"].")
+        elif not {"price", "volume"} & set(require):
+            yield (path, "must include price or volume; market alone is refused",
+                   f"Add price or volume to {path}.")
+        elif "market" in require and not has_market:
+            yield (path, "names market, but this watch has no market object",
+                   f"Leave market out of {path}; the operator adds a market by hand.")
+    gap = watch.get("gap")
+    if isinstance(gap, dict):
+        rearm, move = gap.get("rearm_pct"), gap.get("move_pct")
+        if _is_number(rearm) and _is_number(move) and rearm > move:
+            yield ("gap.rearm_pct", f"{rearm} would exceed gap.move_pct {move}",
+                   "Keep gap.rearm_pct at or below gap.move_pct; change both in one call if "
+                   "both must move.")
+
+
+def normalise_changes(changes) -> dict:
+    """Validate a partial watch and return it as {dotted path: value}, in the given order."""
     if not isinstance(changes, dict) or not changes:
         raise _bad("changes: a non-empty object is required, a partial watch such as "
                    "{\"tiers\": {\"early\": {\"move_pct\": 1.0}}}",
                    "Call again with the fields to change.", path="changes")
-    flat = _flatten_changes(changes)
+    return _flatten_changes(changes)
+
+
+def plan_changes(watch, changes):
+    """Validate a partial watch against one watch. Returns (after, changed paths). Pure."""
+    flat = normalise_changes(changes)
     after = copy.deepcopy(watch)
     changed = []
     for path, value in flat.items():
@@ -650,38 +760,265 @@ def plan_changes(watch, changes):
         if leaf not in node or not _same(node[leaf], value):
             changed.append(path)
             node[leaf] = value
-
-    tiers = after.get("tiers") or {}
-    early, firm = tiers.get("early") or {}, tiers.get("firm") or {}
-    for field in ("move_pct", "volume_x"):
-        lo, hi = early.get(field), firm.get(field)
-        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and lo > hi:
-            raise _bad(f"tiers.early.{field}: {lo} would exceed the firm tier's {hi}",
-                       f"Keep tiers.early.{field} at or below tiers.firm.{field}; change both "
-                       "in one call if both must move.", path=f"tiers.early.{field}")
+    for path, problem, next_action in _cross_field_faults(after):
+        raise _bad(f"{path}: {problem}", next_action, path=path)
     return after, changed
 
 
-def _check_overrides(rules, overrides):
+def _check_overrides(rules, overrides) -> dict:
+    """Validate overrides and return them nested, keyed by watch id, for the backtest."""
     if not isinstance(overrides, dict) or not overrides:
         raise _bad("overrides: must be a non-empty object keyed by watch id",
                    "Pass overrides such as {\"example-watch\": {\"tiers\": {\"early\": "
                    "{\"move_pct\": 1.0}}}}, or leave it out.", path="overrides")
+    nested = {}
     for watch_id, changes in overrides.items():
         try:
             plan_changes(_find_watch(rules, watch_id), changes)
+            nested[watch_id] = _nest(normalise_changes(changes))
         except ToolError as exc:
             path = exc.extra.get("path") or ""
             exc.extra["path"] = f"overrides.{watch_id}.{path}".rstrip(".")
             exc.message = f"overrides.{watch_id}: {exc.message}"
             raise
+    return nested
+
+
+# --------------------------------------------------------------------------
+# the whole-file check before a write
+# --------------------------------------------------------------------------
+# A local copy of the engine contract's section 3 field rules. The engine ignores a rules
+# file that breaks any of them, so the writer refuses to produce one. Kept apart from the
+# change rules above on purpose: when the two codebases drift, this check is what says so.
+
+_HHMM = re.compile(r"^(\d{2}):(\d{2})$")
+_MARKET_KINDS = ("ibkr_basket", "nasdaq_quote", "ibkr_contract")
+
+
+class _Fault(Exception):
+    def __init__(self, field, reason):
+        super().__init__(f"{field}: {reason}")
+        self.field, self.reason = field, reason
+
+
+def _num_field(obj, key, where, low, high, required=True, integer=False):
+    field = f"{where}.{key}" if where else key
+    value = obj.get(key)
+    if value is None:
+        if required:
+            raise _Fault(field, "is required")
+        return None
+    if not _is_number(value):
+        raise _Fault(field, "must be a number")
+    if integer and isinstance(value, float) and not value.is_integer():
+        raise _Fault(field, "must be a whole number")
+    if not low <= value <= high:
+        raise _Fault(field, f"must be from {low} to {high}")
+    return value
+
+
+def _obj_field(obj, key, where, required=True):
+    field = f"{where}.{key}" if where else key
+    value = obj.get(key)
+    if value is None:
+        if required:
+            raise _Fault(field, "is required")
+        return None
+    if not isinstance(value, dict):
+        raise _Fault(field, "must be an object")
+    return value
+
+
+def _str_field(obj, key, where, required=True):
+    field = f"{where}.{key}"
+    if key not in obj and not required:
+        return None
+    value = obj.get(key)
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise _Fault(field, "must be a non-empty string" if required else "must be a string")
+    return value
+
+
+def _contract_field(value, field):
+    if not isinstance(value, dict) or not (value.get("symbol") or value.get("con_id")):
+        raise _Fault(field, "needs a symbol or a con_id")
+
+
+def _minutes(value, field):
+    match = _HHMM.match(value) if isinstance(value, str) else None
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise _Fault(field, "must be HH:MM")
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _check_watch(watch, where):
+    from zoneinfo import ZoneInfo
+
+    if not isinstance(watch.get("enabled", True), bool):
+        raise _Fault(f"{where}.enabled", "must be true or false")
+    _str_field(watch, "subject", where)
+    for key in ("label", "venue", "context"):
+        _str_field(watch, key, where, required=False)
+    _num_field(watch, "no_tick_alarm_min", where, 1, 120, required=False, integer=True)
+    _contract_field(watch.get("contract"), f"{where}.contract")
+
+    hours = _obj_field(watch, "hours", where)
+    tz = _str_field(hours, "tz", f"{where}.hours")
+    try:
+        ZoneInfo(tz)
+    except Exception:
+        raise _Fault(f"{where}.hours.tz", "is not a known time zone") from None
+    if (_minutes(hours.get("open"), f"{where}.hours.open")
+            >= _minutes(hours.get("close"), f"{where}.hours.close")):
+        raise _Fault(f"{where}.hours", "open must be before close")
+
+    price = _obj_field(watch, "price", where)
+    if price.get("source") not in ("last", "mid"):
+        raise _Fault(f"{where}.price.source", "must be last or mid")
+    _num_field(price, "lookback_min", f"{where}.price", 1, 30, integer=True)
+    _num_field(price, "max_spread_pct", f"{where}.price", 0.05, 10.0, required=False)
+
+    volume = _obj_field(watch, "volume", where)
+    window = volume.get("window_min")
+    if isinstance(window, bool) or window not in (1, 3):
+        raise _Fault(f"{where}.volume.window_min", "must be 1 or 3")
+    if volume.get("baseline") not in ("median", "mean"):
+        raise _Fault(f"{where}.volume.baseline", "must be median or mean")
+    baseline = _num_field(volume, "baseline_min", f"{where}.volume", 1, 90, integer=True)
+    if baseline % window:
+        raise _Fault(f"{where}.volume.baseline_min", "must be a multiple of window_min")
+    _num_field(volume, "min_trades", f"{where}.volume", 0, 1000, required=False, integer=True)
+    _num_field(volume, "min_dollars", f"{where}.volume", 0, 100_000_000, required=False)
+
+    market = _obj_field(watch, "market", where, required=False)
+    if market is not None:
+        kind = market.get("kind")
+        if kind not in _MARKET_KINDS:
+            raise _Fault(f"{where}.market.kind", "must be " + ", ".join(_MARKET_KINDS))
+        if kind == "ibkr_basket":
+            symbols = market.get("symbols")
+            if not isinstance(symbols, list) or not symbols or not all(
+                    isinstance(s, str) and s for s in symbols):
+                raise _Fault(f"{where}.market.symbols", "must be a non-empty list of symbols")
+            fresh = _num_field(market, "min_fresh", f"{where}.market", 1, 50, integer=True)
+            if fresh > len(symbols):
+                raise _Fault(f"{where}.market.min_fresh", "is larger than the basket")
+            _str_field(market, "exchange", f"{where}.market")
+            _str_field(market, "currency", f"{where}.market")
+        elif kind == "nasdaq_quote":
+            _str_field(market, "symbol", f"{where}.market")
+        else:
+            _contract_field(market.get("contract"), f"{where}.market.contract")
+
+    tiers = _obj_field(watch, "tiers", where)
+    if set(tiers) != {"early", "firm"}:
+        raise _Fault(f"{where}.tiers", "must hold exactly the keys early and firm")
+    for name in ("early", "firm"):
+        tier = _obj_field(tiers, name, f"{where}.tiers")
+        _num_field(tier, "move_pct", f"{where}.tiers.{name}", 0.05, 20.0)
+        _num_field(tier, "volume_x", f"{where}.tiers.{name}", 1.0, 100.0)
+
+    gap = _obj_field(watch, "gap", where, required=False)
+    if gap is not None:
+        _str_field(gap, "against", f"{where}.gap")
+        _num_field(gap, "ratio", f"{where}.gap", 0.0001, 10000.0)
+        _contract_field(gap.get("fx"), f"{where}.gap.fx")
+        _num_field(gap, "move_pct", f"{where}.gap", 0.05, 20.0)
+        _num_field(gap, "step_pct", f"{where}.gap", 0.1, 10.0)
+        _num_field(gap, "rearm_pct", f"{where}.gap", 0.1, 10.0)
+        if price.get("source") != "mid":
+            raise _Fault(f"{where}.gap", "needs price.source mid")
+
+    for path, problem, _ in _cross_field_faults(watch):
+        raise _Fault(f"{where}.{path}", problem)
+
+
+def _check_rules_file(rules):
+    if not isinstance(rules, dict):
+        raise _Fault("rules", "must be a JSON object")
+    if rules.get("v") != 1 or isinstance(rules.get("v"), bool):
+        raise _Fault("v", "must be 1")
+    _num_field(rules, "cooldown_min", "", 1, 240, integer=True)
+    recipients = _obj_field(rules, "recipients", "")
+    email = recipients.get("email", [])
+    if not isinstance(email, list) or not all(isinstance(a, str) and "@" in a for a in email):
+        raise _Fault("recipients.email", "must be a list of addresses")
+    whatsapp = recipients.get("whatsapp", [])
+    if not isinstance(whatsapp, list) or not all(
+            isinstance(n, str) and (n.isdigit() or n.endswith("@g.us")) for n in whatsapp):
+        raise _Fault("recipients.whatsapp", "must hold digits-only numbers or ids ending @g.us")
+    watches = rules.get("watches")
+    if not isinstance(watches, list):
+        raise _Fault("watches", "must be a list")
+    ids = []
+    for i, watch in enumerate(watches):
+        if not isinstance(watch, dict):
+            raise _Fault(f"watches.{i}", "must be an object")
+        wid = watch.get("id")
+        if not isinstance(wid, str) or not WATCH_ID.match(wid):
+            raise _Fault(f"watches.{i}.id", "may hold only lower case letters, digits and -")
+        if wid in ids:
+            raise _Fault(f"watches.{i}.id", "repeats another watch id")
+        ids.append(wid)
+        _check_watch(watch, f"watches.{wid}")
+    for watch in watches:
+        gap = watch.get("gap")
+        if isinstance(gap, dict) and (gap["against"] not in ids or gap["against"] == watch["id"]):
+            raise _Fault(f"watches.{watch['id']}.gap.against", "must name another watch")
+
+
+def check_rules(rules) -> None:
+    """Refuse a whole rules file the engine would ignore. Raises ``bad_argument``."""
+    try:
+        _check_rules_file(rules)
+    except _Fault as fault:
+        raise _bad(f"rules: the merged rules break the engine's field rules at "
+                   f"{fault.field}: {fault.reason}",
+                   "Nothing was written. If the fault is in a field this tool cannot change, "
+                   "tell the operator the rules file needs fixing by hand.",
+                   path="rules", field=fault.field) from None
+
+
+def _engine_check(cfg, runner):
+    """The engine's own validator on the temp file, when ``LACUNA_PRICE_ALERTS_VALIDATOR``
+    names it. Returns a check for ``_atomic_write``, or None when it is not named."""
+    if cfg.validator_path is None:
+        return None
+    if not cfg.validator_path.is_file():
+        raise _unavailable(f"the rules validator {cfg.validator_path} does not exist")
+
+    def check(tmp_path):
+        argv = [cfg.python, str(cfg.validator_path), "--check", str(tmp_path)]
+        failed = ("Nothing was written. Tell the operator the engine's rules check could not "
+                  "run on the server.")
+        try:
+            code, stdout, _ = runner(argv, dict(os.environ), VALIDATOR_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise ToolError("validator_failed", f"the engine's rules check ran past its "
+                            f"{VALIDATOR_TIMEOUT_SECONDS} second limit", failed)
+        except OSError as exc:
+            raise ToolError("validator_failed",
+                            f"the engine's rules check could not be started ({exc})", failed)
+        if code == 0:
+            return
+        line = next((ln.strip() for ln in (stdout or "").splitlines() if ln.strip()), "")
+        if code == 2:
+            raise _bad(f"the engine's own check refused the merged rules: {line}",
+                       "Nothing was written. Read the message, fix the change, and call "
+                       "again. If the fault is in a field this tool cannot change, tell the "
+                       "operator the rules file needs fixing by hand.", path="rules")
+        raise ToolError("validator_failed",
+                        f"the engine's rules check exited {code} without a verdict", failed,
+                        exit_code=code)
+
+    return check
 
 
 # --------------------------------------------------------------------------
 # ibkr_update_price_alert
 # --------------------------------------------------------------------------
 
-def update_alert(cfg, args, can_write) -> dict:
+def update_alert(cfg, args, can_write, runner=None) -> dict:
     if not can_write:
         raise ToolError(
             "write_not_allowed",
@@ -697,6 +1034,7 @@ def update_alert(cfg, args, can_write) -> dict:
     path = cfg.rules_path
     if not path.is_file():
         raise _unavailable(f"the rules file {path} does not exist")
+    engine_check = _engine_check(cfg, runner or run_subprocess)
     try:
         lock_fd = os.open(cfg.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as exc:
@@ -712,7 +1050,9 @@ def update_alert(cfg, args, can_write) -> dict:
         if changed:
             index = rules["watches"].index(watch)
             rules["watches"][index] = after
-            _atomic_write(path, json.dumps(rules, indent=2, ensure_ascii=False) + "\n")
+            check_rules(rules)
+            _atomic_write(path, json.dumps(rules, indent=2, ensure_ascii=False) + "\n",
+                          check=engine_check)
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -726,25 +1066,37 @@ def update_alert(cfg, args, can_write) -> dict:
     return payload
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    """Temp file in the same directory, fsync, rename over, fsync the directory.
+def _atomic_write(path: Path, text: str, check=None) -> None:
+    """Temp file beside the real file, fsync, optional check, rename over, fsync the directory.
 
     A reader sees the old file or the new one, never half of either. The file keeps its mode.
+    A symlinked rules file stays a link: the write goes to the file it points at. ``check``
+    gets the temp file's path and raises ToolError to stop the rename.
     """
+    path = Path(os.path.realpath(path))
     mode = os.stat(path).st_mode & 0o7777
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+
+    def discard():
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             os.fchmod(fh.fileno(), mode)
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
+        if check is not None:
+            check(tmp)
         os.replace(tmp, path)
+    except ToolError:
+        discard()
+        raise
     except OSError as exc:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        discard()
         raise ToolError("write_failed", f"the rules file {path} could not be written ({exc})",
                         "Nothing was changed. Tell the operator the rules file could not be "
                         "written on the server.")
@@ -803,7 +1155,7 @@ def backtest_alert(cfg, args, runner) -> dict:
         _find_watch(rules, watch_id)
     overrides = args.get("overrides")
     if overrides is not None:
-        _check_overrides(rules, overrides)
+        overrides = _check_overrides(rules, overrides)
     if not cfg.backtest_path.is_file():
         raise _unavailable(f"the backtest script {cfg.backtest_path} does not exist")
 

@@ -660,6 +660,7 @@ these names is an unknown tool, exactly as before.
 | `LACUNA_PRICE_ALERTS_BACKTEST` | the engine's `backtest.py` | `~/price-alerts/services/price-alerts/backtest.py` |
 | `LACUNA_PRICE_ALERTS_PYTHON` | the interpreter that runs it | this server's own |
 | `LACUNA_PRICE_ALERTS_STDIO_WRITE` | `1` lets the stdio server change rules | unset: stdio is read only |
+| `LACUNA_PRICE_ALERTS_VALIDATOR` | the engine's `config.py`, run as `python config.py --check FILE` on every write | unset: that check is skipped |
 
 | Tool | Arguments | Returns |
 |---|---|---|
@@ -672,9 +673,15 @@ these names is an unknown tool, exactly as before.
 Rules every one of them keeps:
 
 - **No recipient leaves the server.** The listing returns only how many email
-  and WhatsApp recipients there are. Every payload is also scrubbed:
-  any recipient value found inside any string is replaced with `[recipient]`.
-  The heartbeat's `rules_error` is never returned, since it can quote the file.
+  and WhatsApp recipients there are. Every payload, a result or an error, is
+  also scrubbed: any recipient value found inside any string (an error's
+  message, `next_action` and extra fields included) is replaced with
+  `[recipient]`. An exception other than a tool error leaves as
+  `price_alert_tool_failed`, scrubbed the same way. When the rules file cannot
+  be read, nothing says which values to scrub, so an error then carries only its
+  code, a fixed message and `next_action`, never text from a subprocess or an
+  exception. The heartbeat's `rules_error` is never returned, since it can
+  quote the file.
 - **Caps are stated.** The tape window ends at the newest row; `truncated` is
   true when older rows exist before it. History fetches one row past `limit`,
   so `truncated` is exact.
@@ -684,6 +691,10 @@ Rules every one of them keeps:
 - **Missing files are errors with a next action.** A missing or unreadable
   `tape.db`, `heartbeat.json` or rules file is `price_alerts_unavailable`. The
   tape is opened read only (`file:...?mode=ro`).
+- **The engine may add fields.** Extra heartbeat keys (such as `started_ts`),
+  extra columns, and reference rows named `ref:<NAME>` in `minutes.instrument`
+  are ignored. A heartbeat with `rules_ok: false` does not stop the listing;
+  `engine.rules_ok` reports it.
 
 `ibkr_update_price_alert` may change, for one watch: `tiers.early` and
 `tiers.firm` (`move_pct` 0.05 to 20, `volume_x` 1 to 100, `require` a non-empty
@@ -691,18 +702,52 @@ list drawn from `price`, `volume`, `market` without repeats),
 `volume.min_trades` (whole number, 0 to 1000), `volume.min_dollars` (0 to
 100000000), `price.max_spread_pct` (0.05 to 10), `gap.move_pct` (0.05 to 20),
 `gap.step_pct` and `gap.rearm_pct` (0.1 to 10), and `enabled` (true or false).
-After the merge the early tier's `move_pct` and `volume_x` may not exceed the
-firm tier's. Any other path, an out-of-range or non-numeric value, a gap change
-on a watch without a gap rule, or an unknown watch is `bad_argument`, and the
-error's `path` names the offending dotted path. The write holds an exclusive
-`flock` on `<rules>.lock` for the whole read, merge and write, writes a temp
-file in the same directory, fsyncs it, renames it over the old file and keeps
-its mode. Unknown keys and key order survive. A change that alters nothing
-returns `changed: []` and leaves the file untouched. Without write access the
-answer is `write_not_allowed`.
+A key in `changes` may be nested or dotted (`{"tiers.early.move_pct": 0.5}`);
+both are turned into one nested object before anything is applied, and a dotted
+key and a nested key that reach the same field are refused.
+
+The engine's cross-field rules hold on the merged watch, checked whole, so a
+fault already in a field the change did not touch also stops the write:
+
+- `tiers.early.move_pct` <= `tiers.firm.move_pct`, and the same for `volume_x`;
+- with a `gap`, `gap.rearm_pct` <= `gap.move_pct`;
+- every tier's `require` is a non-empty list of distinct names from `price`,
+  `volume`, `market`, and holds `price` or `volume` (market alone is refused);
+- `market` may appear in `require` only when the watch has a `market` object;
+- a change under `gap` is refused when the watch has no `gap`. A change to
+  `price.max_spread_pct`, `volume.min_trades` or `volume.min_dollars` is allowed
+  whether or not the field is there today; it adds the floor.
+
+Any other path, an out-of-range or non-numeric value (a huge integer included),
+a break of a rule above, or an unknown watch is `bad_argument`, and the error's
+`path` names the offending dotted path.
+
+Two checks then run on the whole merged rules file before anything is written,
+so that drift between this server and the engine shows as a refusal and never
+as a file the engine ignores. First a local copy of the engine contract's
+section 3 field rules (types, bounds, enums, the keys each watch needs, unique
+ids, `gap.against` naming another watch): a fault is `bad_argument` with
+`path: "rules"` and `field` naming the place, such as
+`watches.example-watch.hours.tz`. Second, when `LACUNA_PRICE_ALERTS_VALIDATOR`
+is set, the engine's own check runs on the temp file before the rename:
+`[python, validator, "--check", temp file]`, no shell, a 10 second limit. Exit
+0 lets the rename go ahead. Exit 2 is `bad_argument` with `path: "rules"`
+carrying the first line of its output, scrubbed. Any other exit, a timeout or a
+failure to start is `validator_failed`. A named validator file that does not
+exist is `price_alerts_unavailable`. In every refusal the temp file is removed
+and the rules file is untouched.
+
+The write holds an exclusive `flock` on `<rules>.lock` for the whole read,
+merge and write, writes a temp file beside the real file, fsyncs it, renames it
+over the old file and keeps its mode. A symlinked rules file stays a link: the
+path is resolved first and the file it points at is replaced. Unknown keys and
+key order survive. A change that alters nothing returns `changed: []` and leaves
+the file untouched. Without write access the answer is `write_not_allowed`.
 
 `ibkr_test_price_alert` validates `date` as YYYY-MM-DD and `overrides` with the
-same paths and bounds before it starts anything, then runs
+same paths, bounds and cross-field rules before it starts anything, turns each
+override into a nested object (the engine merges objects, so a dotted key passed
+on as it is would change nothing), then runs
 `[python, backtest, "--json", "--date", date, "--watch", watch, "--overrides", json]`
 with no shell and a 30 second limit. The child gets this server's environment
 plus `PRICE_ALERTS_RULES`, `PRICE_ALERTS_STATE_DIR`, `LACUNA_IBKR_ROOT` (this
@@ -719,6 +764,8 @@ Codes these tools add to the table above:
 | `price_alerts_unavailable` | an engine file is missing or unreadable | the operator |
 | `write_not_allowed` | `ibkr_update_price_alert` without write access | the person, by asking the operator for a write token |
 | `write_failed` | the rules file could not be written; nothing changed | the operator |
+| `validator_failed` | the engine's rules check could not give a verdict; nothing changed | the operator |
+| `price_alert_tool_failed` | an unexpected failure inside a price-alert tool | the operator |
 | `backtest_failed` | the backtest refused or failed | the model for a refusal, else the operator |
 | `backtest_timeout` | the backtest ran past 30 seconds | the model, by narrowing to one watch |
 
